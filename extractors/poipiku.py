@@ -11,6 +11,9 @@ class PoipikuExtractor(BaseExtractor):
     slug = "poipiku"
     URL_PATTERN = re.compile(r'poipiku\.com\/(\d+)(?:\/(\d+)\.html)?')
     CDN_PATTERN = re.compile(r'\"(https:\/\/cdn\.poipiku\.com\/.*?)\"')
+    CARD_PATTERN = re.compile(r'\<a class=\"IllustInfo\" href\=\"\/(\w+)\/(\w+)\.html\"\>')
+    DESC_PATTERN = re.compile(r'\"IllustItemDesc\" \>(.*)\<\/h1\>')
+    TAG_PATTERN = re.compile(r'\"TagName\"\>(.*)\<\/div\>')
     DETAIL_LINK = "https://poipiku.com/f/ShowIllustDetailF.jsp"
 
     def default_config(self) -> dict:
@@ -27,24 +30,41 @@ class PoipikuExtractor(BaseExtractor):
     def extract(self, url: str, extr_config: dict = {}) -> Generator[DiscoveredNode, None, None]:
         matches = self.URL_PATTERN.findall(url)
         for match in matches:
-            if len(match) == 1:
-                # TODO: Handle user profile pages
-                pass
             if len(match) == 2:
+                if match[1] == "":
+                    yield from self.extract_profile(match[0], extr_config)
+                    continue
                 yield from self.extract_post(match[0], match[1], extr_config)
     
     def extract_profile(self, user_id: str, extr_config: dict = {}) -> Generator[DiscoveredNode, None, None]:
-        pass
+        req = self.session.request("POST", f"https://poipiku.com/{user_id}")
+        req.text
+        for post in self.CARD_PATTERN.findall(req.text):
+            yield from self.extract_post(user_id, post[1], extr_config)
 
     def extract_post(self, user_id: str, post_id: str, extr_config: dict = {}) -> Generator[DiscoveredNode, None, None]:
         logger.info(f"[{self.name}] Processing Post: {user_id} / {post_id}")
         
-        if 'password_list' in extr_config:
+        req = self.session.request("GET", f"https://poipiku.com/{user_id}/{post_id}.html")
+        desc = self.DESC_PATTERN.findall(req.text)[0]
+        tags = self.TAG_PATTERN.findall(req.text)
+            
+
+        post_data = {
+            "description": desc,
+            "password": None,
+            "poipiku_tags":[]
+        }
+        if tags:
+            for tag in tags:
+                post_data["poipiku_tags"].append(str(tag))
+
+        if 'password_list' in extr_config and extr_config['password_list'] is not None:
             password_list = extr_config['password_list']
             success = False
             for _pass in password_list:
                 try:
-                    yield from self._extract_post(user_id, post_id, extr_config | {"password": _pass})
+                    yield from self._extract_post(user_id, post_id, post_data, extr_config | {"password": _pass})
                     success = True
                     break
                 except Exception as e:
@@ -52,10 +72,10 @@ class PoipikuExtractor(BaseExtractor):
             if success == False:
                 raise Exception("Failed to extract post with all passwords")          
         else:
-            yield from self._extract_post(user_id, post_id, extr_config)
+            yield from self._extract_post(user_id, post_id, post_data, extr_config)
 
 
-    def _extract_post(self, user_id: str, post_id: str, extr_config: dict) -> Generator[DiscoveredNode, None, None]:
+    def _extract_post(self, user_id: str, post_id: str, post_data: dict, extr_config: dict) -> Generator[DiscoveredNode, None, None]:
         # Fetch the metadata/HTML to find image links
         req_data = {
             "ID": user_id,
@@ -80,7 +100,7 @@ class PoipikuExtractor(BaseExtractor):
             raise
         
         if data['result'] != 1:
-            raise Exception(f"Failed to correctly fetch metadata with data {data}")
+            raise Exception(f"Failed to correctly fetch metadata with data (wrong password?) {data}")
 
         post_num = 0
         for img_link in self.CDN_PATTERN.findall(data['html']):
@@ -97,7 +117,7 @@ class PoipikuExtractor(BaseExtractor):
                 yield DiscoveredNode(
                     suggested_path=f"poipiku/users/{user_id}/{filename}",
                     node_type="RECORD",
-                    metadata={"password": extr_config["password"]},
+                    metadata=post_data | {"password": extr_config["password"]},
                     files=[DiscoveredFile(
                         stream=response.raw, 
                         original_name=filename,

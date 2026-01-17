@@ -15,8 +15,10 @@ if __name__ == "__main__":
         job = Job(JobConfig("C:/Users/elfia/OneDrive/Desktop/DLFI.py/.archive/cookies/cookies.txt"))
         job.db = db
         
+        job.run("https://poipiku.com/379309/1806892.html")
+        # job.run("https://poipiku.com/10085584/", {"password":"yes"})
         # job.run("https://poipiku.com/11581691/12396628.html")
-        job.run("https://poipiku.com/10085584/11726312.html", {"password_list": ["","","","","","","","","","","","","","","","","","","","","","","","yes"]})
+        # job.run("https://poipiku.com/10085584/11726312.html", {"password_list": ["","","","","","","","","","","","","","","","","","","","","","","","yes"]})
 
         db.export(EXPORT_DIR)
     except Exception as e:
