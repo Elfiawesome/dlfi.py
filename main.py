@@ -16,7 +16,7 @@ if __name__ == "__main__":
         job.db = db
         
         job.run("https://poipiku.com/379309/1806892.html")
-        # job.run("https://poipiku.com/10085584/", {"password":"yes"})
+        job.run("https://poipiku.com/10085584/", {"password":"yes"})
         # job.run("https://poipiku.com/11581691/12396628.html")
         # job.run("https://poipiku.com/10085584/11726312.html", {"password_list": ["","","","","","","","","","","","","","","","","","","","","","","","yes"]})
 

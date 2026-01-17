@@ -1,6 +1,6 @@
 import re
 import logging
-from typing import Generator
+from typing import Generator, List
 from .base import BaseExtractor
 from dlfi.models import DiscoveredNode, DiscoveredFile
 
@@ -9,121 +9,155 @@ logger = logging.getLogger(__name__)
 class PoipikuExtractor(BaseExtractor):
     name = "Poipiku"
     slug = "poipiku"
+    
     URL_PATTERN = re.compile(r'poipiku\.com\/(\d+)(?:\/(\d+)\.html)?')
-    CDN_PATTERN = re.compile(r'\"(https:\/\/cdn\.poipiku\.com\/.*?)\"')
-    CARD_PATTERN = re.compile(r'\<a class=\"IllustInfo\" href\=\"\/(\w+)\/(\w+)\.html\"\>')
-    DESC_PATTERN = re.compile(r'\"IllustItemDesc\" \>(.*)\<\/h1\>')
-    TAG_PATTERN = re.compile(r'\"TagName\"\>(.*)\<\/div\>')
-    DETAIL_LINK = "https://poipiku.com/f/ShowIllustDetailF.jsp"
+    CDN_PATTERN = re.compile(r'[\"\'](https:\/\/cdn\.poipiku\.com\/.*?)[\"\']')
+    CARD_PATTERN = re.compile(r'class=[\"\']IllustInfo[\"\']\s+href=[\"\']\/(\w+)\/(\w+)\.html[\"\']')
+    DESC_PATTERN = re.compile(r'class=[\"\']IllustItemDesc[\"\'][^>]*>(.*?)<\/', re.IGNORECASE | re.DOTALL)
+    TAG_PATTERN = re.compile(r'class=[\"\']TagName[\"\'][^>]*>(.*?)<\/', re.IGNORECASE)
+
+    DETAIL_ENDPOINT = "https://poipiku.com/f/ShowIllustDetailF.jsp"
 
     def default_config(self) -> dict:
         return {
             "password": None,
-            "password_list": None
+            "password_list": []
         }
 
     def can_handle(self, url: str) -> bool:
-        if self.URL_PATTERN.search(url):
-            return True
-        return False
-    
+        return bool(self.URL_PATTERN.search(url))
+
     def extract(self, url: str, extr_config: dict = {}) -> Generator[DiscoveredNode, None, None]:
-        matches = self.URL_PATTERN.findall(url)
-        for match in matches:
-            if len(match) == 2:
-                if match[1] == "":
-                    yield from self.extract_profile(match[0], extr_config)
-                    continue
-                yield from self.extract_post(match[0], match[1], extr_config)
-    
-    def extract_profile(self, user_id: str, extr_config: dict = {}) -> Generator[DiscoveredNode, None, None]:
-        req = self.session.request("POST", f"https://poipiku.com/{user_id}")
-        req.text
-        for post in self.CARD_PATTERN.findall(req.text):
-            yield from self.extract_post(user_id, post[1], extr_config)
+        cfg = self.default_config() | extr_config
+        match = self.URL_PATTERN.search(url)
+        if not match:
+            return
 
-    def extract_post(self, user_id: str, post_id: str, extr_config: dict = {}) -> Generator[DiscoveredNode, None, None]:
-        logger.info(f"[{self.name}] Processing Post: {user_id} / {post_id}")
-        
-        req = self.session.request("GET", f"https://poipiku.com/{user_id}/{post_id}.html")
-        desc = self.DESC_PATTERN.findall(req.text)[0]
-        tags = self.TAG_PATTERN.findall(req.text)
-            
+        user_id, post_id = match.groups()
 
-        post_data = {
-            "description": desc,
-            "password": None,
-            "poipiku_tags":[]
-        }
-        if tags:
-            for tag in tags:
-                post_data["poipiku_tags"].append(str(tag))
-
-        if 'password_list' in extr_config and extr_config['password_list'] is not None:
-            password_list = extr_config['password_list']
-            success = False
-            for _pass in password_list:
-                try:
-                    yield from self._extract_post(user_id, post_id, post_data, extr_config | {"password": _pass})
-                    success = True
-                    break
-                except Exception as e:
-                    logger.info("Failed to extract, trying a different password...")
-            if success == False:
-                raise Exception("Failed to extract post with all passwords")          
+        if post_id:
+            yield from self.process_post(user_id, post_id, cfg)
         else:
-            yield from self._extract_post(user_id, post_id, post_data, extr_config)
-
-
-    def _extract_post(self, user_id: str, post_id: str, post_data: dict, extr_config: dict) -> Generator[DiscoveredNode, None, None]:
-        # Fetch the metadata/HTML to find image links
-        req_data = {
-            "ID": user_id,
-            "TD": post_id,
-            "AD": -1,
-            "PAS": extr_config["password"]
-        }
-        req_headers = {
-            "Origin":"https://poipiku.com",
-            "referer": f"https://poipiku.com/{user_id}/{post_id}.html"
-        }
-        req = self.session.request("POST", self.DETAIL_LINK, data=req_data, headers=req_headers)
-
-        data = None
-        try:
-            req.raise_for_status()
-            data = req.json()
-            if not data:
-                raise Exception("No data returned")
-        except Exception as e:
-            logger.error(f"Failed to fetch metadata for {post_id}: {e}")
-            raise
+            yield from self.process_profile(user_id, cfg)
+    
+    def process_profile(self, user_id: str, config: dict) -> Generator[DiscoveredNode, None, None]:
+        logger.info(f"[{self.name}] Scanning profile: {user_id}")
         
-        if data['result'] != 1:
-            raise Exception(f"Failed to correctly fetch metadata with data (wrong password?) {data}")
+        url = f"https://poipiku.com/{user_id}/"
+        resp = self._request("GET", url)
+        
+        found = self.CARD_PATTERN.findall(resp.text)
+        logger.info(f"[{self.name}] Found {len(found)} posts on profile page.")
 
-        post_num = 0
-        for img_link in self.CDN_PATTERN.findall(data['html']):
-            img_url = str(img_link)
-            
+        for p_user, p_id in found:
+            # Ensure we only grab posts for this user (ignore recommendations)
+            if str(p_user) == str(user_id):
+                yield from self.process_post(p_user, p_id, config)
+
+    def process_post(self, user_id: str, post_id: str, config: dict) -> Generator[DiscoveredNode, None, None]:
+        logger.info(f"[{self.name}] Processing Post {post_id} (User: {user_id})")
+        
+        page_url = f"https://poipiku.com/{user_id}/{post_id}.html"
+        
+        # 1. Fetch Landing Page (Metadata)
+        try:
+            resp = self._request("GET", page_url)
+        except Exception:
+            # 404 or other error, skip this node
+            return
+
+        html = resp.text
+        
+        # Extract Metadata
+        desc_match = self.DESC_PATTERN.search(html)
+        description = desc_match.group(1).strip() if desc_match else ""
+        tags = [t.strip() for t in self.TAG_PATTERN.findall(html)]
+
+        metadata = {
+            "description": description,
+            "url": page_url,
+            "author_id": user_id,
+            "post_id": post_id
+        }
+
+        # 2. Resolve Images (Handle Passwords)
+        image_urls = self._resolve_images(user_id, post_id, config)
+        
+        if not image_urls:
+            logger.warning(f"[{self.name}] No images found for {post_id}. Skipping (Auth failed or text-only).")
+            return
+
+        # 3. Create File Streams
+        for idx, img_url in enumerate(image_urls):
             try:
-                response = self.session.get(img_url, stream=True)
-                response.raise_for_status()
-                response.raw.decode_content = True
-
-                ext = "." + img_url.split("?")[0].split(".")[-1]
-                filename = f"{user_id}_{post_id}_{post_num}{ext}"
-
+                # Deduce extension from URL
+                path_part = img_url.split("?")[0]
+                ext = "." + path_part.split(".")[-1]
+                filename = f"{user_id}_{post_id}_{idx}{ext}"
+                
+                # Request stream
+                img_resp = self._request("GET", img_url, stream=True)
+                img_resp.raw.decode_content = True
+                
                 yield DiscoveredNode(
-                    suggested_path=f"poipiku/users/{user_id}/{filename}",
+                    suggested_path=f"poipiku/users/{user_id}/{post_id}",
                     node_type="RECORD",
-                    metadata=post_data | {"password": extr_config["password"]},
+                    metadata=metadata,
                     files=[DiscoveredFile(
-                        stream=response.raw, 
                         original_name=filename,
-                        source_url=img_url
-                    )]
+                        source_url=img_url,
+                        stream=img_resp.raw
+                    )],
+                    tags=tags,
+                    relationships=[
+                        ("AUTHORED_BY", f"poipiku/users/{user_id}")
+                    ]
                 )
             except Exception as e:
-                raise e
-            post_num += 1
+                logger.error(f"[{self.name}] Error streaming image {img_url}: {e}")
+
+
+    def _resolve_images(self, user_id: str, post_id: str, config: dict) -> List[str]:
+        """
+        Tries passwords against the AJAX endpoint to get image URLs.
+        """
+        passwords = []
+        if config.get("password"):
+            passwords.append(config["password"])
+        if config.get("password_list"):
+            passwords.extend(config["password_list"])
+        
+        # Always try empty password (for public posts) if not already included
+        if "" not in passwords:
+            passwords.append("")
+        
+        headers = {
+            "Origin": "https://poipiku.com",
+            "Referer": f"https://poipiku.com/{user_id}/{post_id}.html"
+        }
+
+        for pwd in passwords:
+            data = {
+                "ID": user_id,
+                "TD": post_id,
+                "AD": -1,
+                "PAS": pwd
+            }
+            
+            try:
+                r = self._request("POST", self.DETAIL_ENDPOINT, data=data, headers=headers)
+                json_data = r.json()
+                
+                # API Result: 1 = Success
+                if json_data.get("result") == 1:
+                    html_content = json_data.get("html", "")
+                    images = self.CDN_PATTERN.findall(html_content)
+                    if images:
+                        if pwd:
+                            logger.info(f"[{self.name}] Unlocked {post_id} with password.")
+                        return list(set(images)) # Deduplicate
+            except Exception as e:
+                logger.debug(f"[{self.name}] Password check failed for {post_id}: {e}")
+        
+        logger.error(f"[{self.name}] Failed to resolve images for {post_id}. Exhausted password list.")
+        return []

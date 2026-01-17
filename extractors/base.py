@@ -64,6 +64,19 @@ class BaseExtractor(ABC):
             tf.close()
             return tf.name
 
+    def _request(self, method: str, url: str, **kwargs) -> requests.Response:
+        """
+        Modular request wrapper handling timeouts, status checks, and logging.
+        """
+        try:
+            kwargs.setdefault("timeout", 30)
+            resp = self.session.request(method, url, **kwargs)
+            resp.raise_for_status()
+            return resp
+        except requests.RequestException as e:
+            logger.error(f"[{self.name}] Request failed: {method} {url} - {e}")
+            raise
+
     @property
     @abstractmethod
     def name(self) -> str:
