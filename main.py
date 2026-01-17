@@ -1,56 +1,71 @@
 from dlfi import DLFI
 import os
+import shutil
 
 ARCHIVE_PATH = "./archive_test"
+EXPORT_PATH = "./archive_export"
 
 def main():
-    print("--- Testing Write Operations ---")
+    # Reset for clean test
+    if os.path.exists(ARCHIVE_PATH): shutil.rmtree(ARCHIVE_PATH)
+    if os.path.exists(EXPORT_PATH): shutil.rmtree(EXPORT_PATH)
+
+    print("--- Initializing ---")
     archive = DLFI(ARCHIVE_PATH)
 
-    # 1. Create Hierarchy
-    print("1. Creating Vault 'manga/jojo'...")
-    vault_id = archive.create_vault("manga/jojo")
-    print(f"   -> Created Vault UUID: {vault_id}")
-
-    # 2. Create Record with Metadata
-    print("2. Creating Record 'manga/jojo/page_1.record'...")
-    meta = {"chapter": 1, "artist": "Araki", "scan_group": "Anon"}
-    record_id = archive.create_record("manga/jojo/page_1.record", metadata=meta)
-    print(f"   -> Created Record UUID: {record_id}")
-
-    # 3. Create a Dummy File to simulate a download
-    dummy_file = "test_image.jpg"
-    with open(dummy_file, "wb") as f:
-        f.write(b"fake_image_content_data_12345")
+    # 1. Setup Data
+    print("--- Creating Data ---")
+    # Author
+    archive.create_record("people/hirohiko_araki.record", {"born": 1960, "job": "Manga Artist"})
     
-    # 4. Store File
-    print("3. Appending file to record...")
+    # Manga
+    archive.create_vault("manga/jojo")
+    
+    # Page Record
+    archive.create_record("manga/jojo/page_1.record", {"chapter": 1})
+
+    # Dummy File
+    dummy_file = "page.jpg"
+    with open(dummy_file, "w") as f: f.write("IMAGE_DATA")
     archive.append_file("manga/jojo/page_1.record", dummy_file)
-    print("   -> File hashed, stored, and linked.")
 
-    # 5. Verify Database Content
-    print("4. Verifying DB...")
-    cursor = archive.conn.execute("""
-        SELECT n.name, n.cached_path, b.storage_path 
-        FROM nodes n
-        JOIN node_files nf ON n.uuid = nf.node_uuid
-        JOIN blobs b ON nf.file_hash = b.hash
-        WHERE n.uuid = ?
-    """, (record_id,))
+    # 2. Link & Tag
+    print("--- Linking & Tagging ---")
     
-    row = cursor.fetchone()
-    if row:
-        print(f"   SUCCESS! Found record: {row[0]}")
-        print(f"   Path: {row[1]}")
-        print(f"   Blob stored at: .dlfi/storage/{row[2]}")
+    # Tagging the Vault
+    archive.add_tag("manga/jojo", "Supernatural")
+    archive.add_tag("manga/jojo", "Action")
+
+    # Linking Vault -> Author
+    archive.link("manga/jojo", "people/hirohiko_araki.record", "AUTHORED_BY")
+
+    # Linking Page -> Author (Just to show granular linking)
+    archive.link("manga/jojo/page_1.record", "people/hirohiko_araki.record", "DRAWN_BY")
+
+    # 3. Export
+    print("--- Exporting to Static Files ---")
+    archive.export(EXPORT_PATH)
+
+    # 4. Verify Export
+    print("--- Verification ---")
+    
+    # Check Jojo Vault Metadata
+    jojo_meta_path = f"{EXPORT_PATH}/manga/jojo/_meta.json"
+    if os.path.exists(jojo_meta_path):
+        with open(jojo_meta_path, 'r') as f:
+            print(f"Jojo Meta: {f.read()}")
     else:
-        print("   ERROR: Could not verify data.")
+        print("ERROR: Jojo meta missing")
+
+    # Check Page File
+    page_file_path = f"{EXPORT_PATH}/manga/jojo/page_1.record/page.jpg"
+    if os.path.exists(page_file_path):
+        print("SUCCESS: Page file exported correctly.")
+    else:
+        print("ERROR: Page file missing in export.")
 
     archive.close()
-    
-    # Cleanup dummy file
-    if os.path.exists(dummy_file):
-        os.remove(dummy_file)
+    if os.path.exists(dummy_file): os.remove(dummy_file)
 
 if __name__ == "__main__":
     main()

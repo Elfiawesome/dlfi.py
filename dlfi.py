@@ -251,3 +251,118 @@ class DLFI:
                 current_parent_uuid = new_uuid
 
         return current_parent_uuid
+    
+	# --- GRAPH OPERATIONS: Linking & Tagging ---
+
+    def link(self, source_path: str, target_path: str, relation: str):
+        """
+        Creates a directed relationship between two nodes.
+        Example: link('manga/jojo', 'people/araki', 'AUTHORED_BY')
+        """
+        src_uuid = self._resolve_path(source_path)
+        tgt_uuid = self._resolve_path(target_path)
+
+        if not src_uuid: raise ValueError(f"Source path not found: {source_path}")
+        if not tgt_uuid: raise ValueError(f"Target path not found: {target_path}")
+
+        with self.conn:
+            self.conn.execute("""
+                INSERT OR REPLACE INTO edges (source_uuid, target_uuid, relation, created_at)
+                VALUES (?, ?, ?, ?)
+            """, (src_uuid, tgt_uuid, relation.upper(), time.time()))
+
+    def add_tag(self, path: str, tag: str):
+        """Adds a primitive string tag to a node."""
+        node_uuid = self._resolve_path(path)
+        if not node_uuid: raise ValueError(f"Node not found: {path}")
+
+        with self.conn:
+            self.conn.execute("""
+                INSERT OR IGNORE INTO tags (node_uuid, tag)
+                VALUES (?, ?)
+            """, (node_uuid, tag.lower()))
+
+    # --- EXPORT SYSTEM: Static Generation ---
+
+    def export(self, output_dir: str):
+        """
+        Generates a static file system version of the archive.
+        Returns: The path to the index.json
+        """
+        out_path = Path(output_dir).resolve()
+        if out_path.exists():
+            print(f"[Export] Cleaning previous export at {out_path}...")
+            shutil.rmtree(out_path)
+        os.makedirs(out_path)
+
+        print("[Export] Building UUID lookup map...")
+        # 1. Build a memory map of UUID -> Path for fast relationship resolution
+        uuid_to_path = {}
+        cursor = self.conn.execute("SELECT uuid, cached_path FROM nodes")
+        for row in cursor:
+            uuid_to_path[row[0]] = row[1]
+
+        print("[Export] Generating hierarchy and files...")
+        # 2. Iterate all nodes and build structure
+        # We fetch everything needed for the meta.json in one go per node would be ideal, 
+        # but for simplicity/readability we will query per node.
+        nodes_cursor = self.conn.execute("SELECT uuid, type, cached_path, metadata FROM nodes")
+        
+        for n_uuid, n_type, n_path, n_meta in nodes_cursor:
+            # Determine physical path
+            # If it's a RECORD, we make it a FOLDER so it can hold the file + meta.json
+            node_out_dir = out_path / n_path
+            os.makedirs(node_out_dir, exist_ok=True)
+
+            # A. Prepare Metadata
+            meta_dict = json.loads(n_meta) if n_meta else {}
+            meta_dict['uuid'] = n_uuid
+            meta_dict['type'] = n_type
+            
+            # B. Fetch Tags
+            tags_cur = self.conn.execute("SELECT tag FROM tags WHERE node_uuid = ?", (n_uuid,))
+            meta_dict['tags'] = [r[0] for r in tags_cur]
+
+            # C. Fetch Relationships (Outgoing)
+            # We resolve UUIDs back to Paths here so the JSON is human-readable
+            rels = []
+            edges_cur = self.conn.execute("SELECT target_uuid, relation FROM edges WHERE source_uuid = ?", (n_uuid,))
+            for tgt_uuid, rel_name in edges_cur:
+                tgt_path = uuid_to_path.get(tgt_uuid, "UNKNOWN_NODE")
+                rels.append({"relation": rel_name, "target_path": tgt_path})
+            meta_dict['relationships'] = rels
+
+            # D. Handle Files (Only for Records usually, but Vaults can technically have attachments in this logic)
+            files_list = []
+            files_cur = self.conn.execute("""
+                SELECT nf.original_name, b.storage_path 
+                FROM node_files nf 
+                JOIN blobs b ON nf.file_hash = b.hash 
+                WHERE nf.node_uuid = ? 
+                ORDER BY nf.display_order
+            """, (n_uuid,))
+            
+            for orig_name, blob_rel_path in files_cur:
+                # Copy physical file
+                src_blob = self.storage_dir / blob_rel_path
+                dst_file = node_out_dir / orig_name
+                
+                # Copy if exists (it should)
+                if src_blob.exists():
+                    shutil.copy2(src_blob, dst_file)
+                    files_list.append(orig_name)
+                else:
+                    print(f"[Warning] Blob missing: {blob_rel_path}")
+
+            meta_dict['files'] = files_list
+
+            # E. Write _meta.json
+            with open(node_out_dir / "_meta.json", "w", encoding='utf-8') as f:
+                json.dump(meta_dict, f, indent=2)
+
+        # 3. Create Global Index (for Search/Frontend)
+        print("[Export] creating index.json...")
+        with open(out_path / "index.json", "w", encoding='utf-8') as f:
+            json.dump(uuid_to_path, f, indent=2)
+        
+        print(f"[Export] Complete. Data available in {out_path}")
