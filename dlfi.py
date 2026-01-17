@@ -130,3 +130,124 @@ class DLFI:
                     break
                 sha256.update(data)
         return sha256.hexdigest()
+
+# --- WRITE OPERATIONS: Vaults & Records ---
+
+    def create_vault(self, path: str, metadata: dict = None) -> str:
+        """
+        Ensures a Vault (folder) exists at the specific path.
+        Creates parents recursively if needed.
+        Returns the UUID of the vault.
+        """
+        return self._resolve_path(path, create_if_missing=True, node_type='VAULT', metadata=metadata)
+
+    def create_record(self, path: str, metadata: dict = None) -> str:
+        """
+        Creates a Record at the specific path.
+        Returns the UUID of the record.
+        """
+        return self._resolve_path(path, create_if_missing=True, node_type='RECORD', metadata=metadata)
+
+    def append_file(self, record_path: str, file_path: str):
+        """
+        1. Hashes the external file.
+        2. Copies it to .dlfi/storage (if not already there).
+        3. Links it to the record.
+        """
+        file_path = Path(file_path)
+        if not file_path.exists():
+            raise FileNotFoundError(f"File not found: {file_path}")
+
+        # 1. Get Node UUID
+        node_uuid = self._resolve_path(record_path, create_if_missing=False)
+        if not node_uuid:
+            raise ValueError(f"Record not found: {record_path}")
+
+        # 2. Calculate Hash (Efficient Streaming)
+        file_hash = self.get_file_hash(str(file_path))
+        file_size = file_path.stat().st_size
+        ext = file_path.suffix.lower().lstrip('.')
+
+        with self.conn:
+            # 3. Check if Blob exists in DB, if not, store it
+            cursor = self.conn.execute("SELECT hash FROM blobs WHERE hash = ?", (file_hash,))
+            if not cursor.fetchone():
+                # Sharding Strategy: first 2 chars / next 2 chars
+                shard_a = file_hash[:2]
+                shard_b = file_hash[2:4]
+                storage_subdir = self.storage_dir / shard_a / shard_b
+                os.makedirs(storage_subdir, exist_ok=True)
+                
+                target_path = storage_subdir / file_hash
+                
+                # Copy physical file
+                shutil.copy2(file_path, target_path)
+
+                # Insert Blob Record
+                rel_path = f"{shard_a}/{shard_b}/{file_hash}"
+                self.conn.execute("""
+                    INSERT INTO blobs (hash, ext, size_bytes, storage_path)
+                    VALUES (?, ?, ?, ?)
+                """, (file_hash, ext, file_size, rel_path))
+
+            # 4. Link Blob to Node (Record)
+            # Check existing order count to append at end
+            cur = self.conn.execute("SELECT COUNT(*) FROM node_files WHERE node_uuid = ?", (node_uuid,))
+            count = cur.fetchone()[0]
+            
+            self.conn.execute("""
+                INSERT INTO node_files (node_uuid, file_hash, original_name, display_order, added_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, (node_uuid, file_hash, file_path.name, count + 1, time.time()))
+            
+            # Update last_modified on the record
+            self.conn.execute("UPDATE nodes SET last_modified = ? WHERE uuid = ?", (time.time(), node_uuid))
+
+    # --- INTERNAL: Path Resolution Logic ---
+
+    def _resolve_path(self, path: str, create_if_missing=False, node_type='VAULT', metadata=None) -> Optional[str]:
+        """
+        Converts a path string (e.g., "manga/jojo") into a UUID.
+        If create_if_missing is True, it builds the hierarchy.
+        """
+        clean_path = path.strip("/").replace("\\", "/") # Normalize
+        parts = clean_path.split("/")
+        
+        current_parent_uuid = None # Root
+        current_path_str = ""
+
+        for i, part in enumerate(parts):
+            is_last = (i == len(parts) - 1)
+            if i > 0:
+                current_path_str += "/"
+            current_path_str += part
+
+            # Check if this node exists
+            cursor = self.conn.execute(
+                "SELECT uuid FROM nodes WHERE parent_uuid IS ? AND name = ?", 
+                (current_parent_uuid, part)
+            )
+            row = cursor.fetchone()
+
+            if row:
+                current_parent_uuid = row[0] # Move down the tree
+            else:
+                if not create_if_missing:
+                    return None # Path doesn't exist
+                
+                # Create it
+                new_uuid = str(uuid.uuid4())
+                # Determine type: Intermediate parts are always VAULTs. Last part uses requested type.
+                actual_type = node_type if is_last else 'VAULT'
+                # Only apply metadata to the exact target, not the parents
+                actual_meta = json.dumps(metadata) if (is_last and metadata) else None
+                
+                with self.conn:
+                    self.conn.execute("""
+                        INSERT INTO nodes (uuid, parent_uuid, type, name, cached_path, metadata, created_at, last_modified)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (new_uuid, current_parent_uuid, actual_type, part, current_path_str, actual_meta, time.time(), time.time()))
+                
+                current_parent_uuid = new_uuid
+
+        return current_parent_uuid
