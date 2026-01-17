@@ -15,14 +15,13 @@ class BaseExtractor(ABC):
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
         })
         
-        self._load_cookies()
 
-    def _load_cookies(self):
+    def load_cookies(self, cookie_file: Optional[str] = None):
         """
         Looks for a 'cookies.txt' (Netscape format) in the current working directory
         and loads it into the session.
         """
-        cookie_file = "cookies.txt"
+        
         if os.path.exists(cookie_file):
             try:
                 # Use standard library to parse Netscape cookie file
@@ -32,6 +31,9 @@ class BaseExtractor(ABC):
                 print(f"[{self.name}] Loaded cookies from {cookie_file}")
             except Exception as e:
                 print(f"[{self.name}] Failed to load cookies: {e}")
+        else:
+            print(f"[{self.name}] No cookies file found: {cookie_file}")
+
 
     def download_to_temp(self, url: str, filename_hint: str = "file") -> str:
         """
