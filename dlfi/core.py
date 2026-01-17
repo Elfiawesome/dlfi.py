@@ -5,8 +5,9 @@ import hashlib
 import uuid
 import shutil
 import time
+import tempfile
 from pathlib import Path
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, IO
 
 class DLFI:
     def __init__(self, archive_root: str):
@@ -17,6 +18,7 @@ class DLFI:
         self.root = Path(archive_root).resolve()
         self.system_dir = self.root / ".dlfi"
         self.storage_dir = self.system_dir / "storage"
+        self.temp_dir = self.system_dir / "temp" # Intermediate area for streams
         self.db_path = self.system_dir / "db.sqlite"
 
         # Initialize directories
@@ -30,7 +32,17 @@ class DLFI:
         """Creates the .dlfi hidden folders if they don't exist."""
         if not self.storage_dir.exists():
             os.makedirs(self.storage_dir, exist_ok=True)
-            print(f"[DLFI] Initialized storage at {self.storage_dir}")
+        if not self.temp_dir.exists():
+            os.makedirs(self.temp_dir, exist_ok=True)
+            
+        # Clean stale temp files from previous runs
+        for tmp_file in self.temp_dir.glob("*"):
+            try:
+                os.remove(tmp_file)
+            except OSError:
+                pass
+
+        print(f"[DLFI] Initialized storage at {self.storage_dir}")
 
     def _get_connection(self) -> sqlite3.Connection:
         """Returns a tuned SQLite connection."""
@@ -150,8 +162,8 @@ class DLFI:
 
     def append_file(self, record_path: str, file_path: str, filename_override: str = None):
         """
-        Appends a file to a record.
-        :param filename_override: If set, uses this name in the archive instead of the source filename.
+        Appends a local file to a record.
+        This optimizes for local files by checking hash before copying.
         """
         file_path = Path(file_path)
         if not file_path.exists():
@@ -164,14 +176,64 @@ class DLFI:
 
         # 2. Determine Archival Filename
         final_name = filename_override if filename_override else file_path.name
-
+        
         # 3. Calculate Hash
         file_hash = self.get_file_hash(str(file_path))
         file_size = file_path.stat().st_size
-        ext = Path(final_name).suffix.lower().lstrip('.')
+        
+        self._store_blob_and_link(node_uuid, file_hash, file_size, final_name, source_path=file_path)
+
+    def append_stream(self, record_path: str, file_stream: IO[bytes], filename: str):
+        """
+        Appends a data stream (e.g. requests.raw or open file) to a record.
+        It saves to a temp file while calculating hash, then moves to storage if unique.
+        """
+        # 1. Get Node UUID
+        node_uuid = self._resolve_path(record_path, create_if_missing=False)
+        if not node_uuid:
+            raise ValueError(f"Record not found: {record_path}")
+
+        # 2. Stream to Temp & Hash
+        sha256 = hashlib.sha256()
+        file_size = 0
+        
+        # Use temp dir inside .dlfi so os.rename works atomically (same filesystem)
+        with tempfile.NamedTemporaryFile(mode='wb', dir=self.temp_dir, delete=False) as tmp_file:
+            tmp_path = Path(tmp_file.name)
+            try:
+                while True:
+                    chunk = file_stream.read(65536) # 64KB chunks
+                    if not chunk:
+                        break
+                    sha256.update(chunk)
+                    tmp_file.write(chunk)
+                    file_size += len(chunk)
+            except Exception as e:
+                tmp_file.close()
+                if tmp_path.exists():
+                    os.remove(tmp_path)
+                raise e
+
+        file_hash = sha256.hexdigest()
+        
+        # 3. Store (Move Temp) & Link
+        try:
+            self._store_blob_and_link(node_uuid, file_hash, file_size, filename, source_path=tmp_path, is_temp=True)
+        except Exception as e:
+            # Cleanup temp if something went wrong in DB logic, though _store usually handles it
+            if tmp_path.exists():
+                os.remove(tmp_path)
+            raise e
+
+    def _store_blob_and_link(self, node_uuid: str, file_hash: str, file_size: int, filename: str, source_path: Path, is_temp: bool = False):
+        """
+        Internal: Handles the DB logic for blobs and linking.
+        :param is_temp: If True, source_path is moved/deleted. If False, source_path is copied.
+        """
+        ext = Path(filename).suffix.lower().lstrip('.')
 
         with self.conn:
-            # 4. Check if Blob exists in DB
+            # 1. Check if Blob exists in DB
             cursor = self.conn.execute("SELECT hash FROM blobs WHERE hash = ?", (file_hash,))
             if not cursor.fetchone():
                 shard_a = file_hash[:2]
@@ -179,9 +241,15 @@ class DLFI:
                 storage_subdir = self.storage_dir / shard_a / shard_b
                 os.makedirs(storage_subdir, exist_ok=True)
                 
-                # Copy physical file
                 target_path = storage_subdir / file_hash
-                shutil.copy2(file_path, target_path)
+                
+                # Physical File Operation
+                if is_temp:
+                    # Move (Atomic on same FS)
+                    shutil.move(str(source_path), str(target_path))
+                else:
+                    # Copy
+                    shutil.copy2(source_path, target_path)
 
                 # Insert Blob Record
                 rel_path = f"{shard_a}/{shard_b}/{file_hash}"
@@ -189,15 +257,20 @@ class DLFI:
                     INSERT INTO blobs (hash, ext, size_bytes, storage_path)
                     VALUES (?, ?, ?, ?)
                 """, (file_hash, ext, file_size, rel_path))
+            else:
+                # Deduplication: Blob exists. 
+                # If it was a temp file (stream), we don't need it anymore.
+                if is_temp and source_path.exists():
+                    os.remove(source_path)
 
-            # 5. Link Blob to Node
+            # 2. Link Blob to Node
             cur = self.conn.execute("SELECT COUNT(*) FROM node_files WHERE node_uuid = ?", (node_uuid,))
             count = cur.fetchone()[0]
             
             self.conn.execute("""
                 INSERT INTO node_files (node_uuid, file_hash, original_name, display_order, added_at)
                 VALUES (?, ?, ?, ?, ?)
-            """, (node_uuid, file_hash, final_name, count + 1, time.time()))
+            """, (node_uuid, file_hash, filename, count + 1, time.time()))
             
             self.conn.execute("UPDATE nodes SET last_modified = ? WHERE uuid = ?", (time.time(), node_uuid))
     
