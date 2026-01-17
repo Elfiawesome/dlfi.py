@@ -1,72 +1,52 @@
 from dlfi import DLFI
-import os
 import shutil
+import os
 
-ARCHIVE_PATH = "./archive_test"
-EXPORT_PATH = "./archive_export"
+ARCHIVE_PATH = "./archive_test_rels"
 
 def main():
-    # Reset for clean test
     if os.path.exists(ARCHIVE_PATH): shutil.rmtree(ARCHIVE_PATH)
-    if os.path.exists(EXPORT_PATH): shutil.rmtree(EXPORT_PATH)
+    db = DLFI(ARCHIVE_PATH)
 
-    print("--- Initializing ---")
-    archive = DLFI(ARCHIVE_PATH)
-
-    # 1. Setup Data
-    print("--- Creating Data ---")
-    # Author
-    archive.create_record("people/hirohiko_araki.record", {"born": 1960, "job": "Manga Artist"})
+    print("--- Setup ---")
     
-    # Manga
-    archive.create_vault("manga/jojo")
+    # 1. Create the Artist
+    db.create_record("people/araki.record", {"job": "mangaka"})
     
-    # Page Record
-    archive.create_record("manga/jojo/page_1.record", {"chapter": 1})
-
-    # Dummy File
-    dummy_file = "page.jpg"
-    with open(dummy_file, "w") as f: f.write("IMAGE_DATA")
-    archive.append_file("manga/jojo/page_1.record", dummy_file)
-
-    # 2. Link & Tag
-    print("--- Linking & Tagging ---")
+    # 2. Create the Vault and a Record inside it
+    db.create_vault("manga/jojo")
+    db.create_record("manga/jojo/chapter1.record", {"pages": 20})
     
-    # Tagging the Vault
-    archive.add_tag("manga/jojo", "Supernatural")
-    archive.add_tag("manga/jojo", "Action")
+    # 3. Create a totally unrelated vault
+    db.create_vault("manga/naruto")
+    db.create_record("manga/naruto/chapter1.record")
 
-    # Linking Vault -> Author
-    archive.link("manga/jojo", "people/hirohiko_araki.record", "AUTHORED_BY")
+    # 4. Link the CHILD record to the Artist
+    print("Linking 'manga/jojo/chapter1.record' -> 'people/araki.record' (DRAWN_BY)")
+    db.link("manga/jojo/chapter1.record", "people/araki.record", "DRAWN_BY")
 
-    # Linking Page -> Author (Just to show granular linking)
-    archive.link("manga/jojo/page_1.record", "people/hirohiko_araki.record", "DRAWN_BY")
+    print("\n--- TEST 1: Direct Relationship ---")
+    # Find the specific chapter drawn by Araki
+    results = db.query().related_to("people/araki.record", "DRAWN_BY").execute()
+    for r in results:
+        print(f"MATCH: {r['path']}")
+    # Expected: manga/jojo/chapter1.record
 
-    # 3. Export
-    print("--- Exporting to Static Files ---")
-    archive.export(EXPORT_PATH)
+    print("\n--- TEST 2: Recursive/Child Relationship (The Vault Query) ---")
+    # Find any VAULT that contains something drawn by Araki
+    # This simulates: "Show me all Manga series that Araki worked on"
+    results = db.query()\
+        .type("VAULT")\
+        .contains_related("people/araki.record", "DRAWN_BY")\
+        .execute()
+        
+    for r in results:
+        print(f"MATCH: {r['path']}")
+    # Expected: manga/jojo
+    # Should NOT find: manga/naruto
 
-    # 4. Verify Export
-    print("--- Verification ---")
-    
-    # Check Jojo Vault Metadata
-    jojo_meta_path = f"{EXPORT_PATH}/manga/jojo/_meta.json"
-    if os.path.exists(jojo_meta_path):
-        with open(jojo_meta_path, 'r') as f:
-            print(f"Jojo Meta: {f.read()}")
-    else:
-        print("ERROR: Jojo meta missing")
-
-    # Check Page File
-    page_file_path = f"{EXPORT_PATH}/manga/jojo/page_1.record/page.jpg"
-    if os.path.exists(page_file_path):
-        print("SUCCESS: Page file exported correctly.")
-    else:
-        print("ERROR: Page file missing in export.")
-
-    archive.close()
-    if os.path.exists(dummy_file): os.remove(dummy_file)
+    db.export("./archive_export")
+    db.close()
 
 if __name__ == "__main__":
     main()
-

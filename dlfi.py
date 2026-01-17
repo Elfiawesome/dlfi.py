@@ -131,7 +131,7 @@ class DLFI:
                 sha256.update(data)
         return sha256.hexdigest()
 
-# --- WRITE OPERATIONS: Vaults & Records ---
+    # --- WRITE OPERATIONS: Vaults & Records ---
 
     def create_vault(self, path: str, metadata: dict = None) -> str:
         """
@@ -148,11 +148,10 @@ class DLFI:
         """
         return self._resolve_path(path, create_if_missing=True, node_type='RECORD', metadata=metadata)
 
-    def append_file(self, record_path: str, file_path: str):
+    def append_file(self, record_path: str, file_path: str, filename_override: str = None):
         """
-        1. Hashes the external file.
-        2. Copies it to .dlfi/storage (if not already there).
-        3. Links it to the record.
+        Appends a file to a record.
+        :param filename_override: If set, uses this name in the archive instead of the source filename.
         """
         file_path = Path(file_path)
         if not file_path.exists():
@@ -163,24 +162,25 @@ class DLFI:
         if not node_uuid:
             raise ValueError(f"Record not found: {record_path}")
 
-        # 2. Calculate Hash (Efficient Streaming)
+        # 2. Determine Archival Filename
+        final_name = filename_override if filename_override else file_path.name
+
+        # 3. Calculate Hash
         file_hash = self.get_file_hash(str(file_path))
         file_size = file_path.stat().st_size
-        ext = file_path.suffix.lower().lstrip('.')
+        ext = Path(final_name).suffix.lower().lstrip('.')
 
         with self.conn:
-            # 3. Check if Blob exists in DB, if not, store it
+            # 4. Check if Blob exists in DB
             cursor = self.conn.execute("SELECT hash FROM blobs WHERE hash = ?", (file_hash,))
             if not cursor.fetchone():
-                # Sharding Strategy: first 2 chars / next 2 chars
                 shard_a = file_hash[:2]
                 shard_b = file_hash[2:4]
                 storage_subdir = self.storage_dir / shard_a / shard_b
                 os.makedirs(storage_subdir, exist_ok=True)
                 
-                target_path = storage_subdir / file_hash
-                
                 # Copy physical file
+                target_path = storage_subdir / file_hash
                 shutil.copy2(file_path, target_path)
 
                 # Insert Blob Record
@@ -190,19 +190,17 @@ class DLFI:
                     VALUES (?, ?, ?, ?)
                 """, (file_hash, ext, file_size, rel_path))
 
-            # 4. Link Blob to Node (Record)
-            # Check existing order count to append at end
+            # 5. Link Blob to Node
             cur = self.conn.execute("SELECT COUNT(*) FROM node_files WHERE node_uuid = ?", (node_uuid,))
             count = cur.fetchone()[0]
             
             self.conn.execute("""
                 INSERT INTO node_files (node_uuid, file_hash, original_name, display_order, added_at)
                 VALUES (?, ?, ?, ?, ?)
-            """, (node_uuid, file_hash, file_path.name, count + 1, time.time()))
+            """, (node_uuid, file_hash, final_name, count + 1, time.time()))
             
-            # Update last_modified on the record
             self.conn.execute("UPDATE nodes SET last_modified = ? WHERE uuid = ?", (time.time(), node_uuid))
-
+    
     # --- INTERNAL: Path Resolution Logic ---
 
     def _resolve_path(self, path: str, create_if_missing=False, node_type='VAULT', metadata=None) -> Optional[str]:
@@ -366,3 +364,136 @@ class DLFI:
             json.dump(uuid_to_path, f, indent=2)
         
         print(f"[Export] Complete. Data available in {out_path}")
+
+    def query(self) -> 'QueryBuilder':
+        """Returns a fluent Query Builder."""
+        # Import here or rely on the class being defined in the same file
+        return QueryBuilder(self)
+
+class QueryBuilder:
+    def __init__(self, dlfi_instance):
+        self.db = dlfi_instance
+        self.conn = dlfi_instance.conn
+        self.conditions = []
+        self.params = []
+        self.tables = ["nodes n"]
+        self.distinct = False
+
+    # --- Basic Filters ---
+
+    def inside(self, path_prefix: str):
+        clean = path_prefix.strip("/")
+        self.conditions.append("n.cached_path LIKE ?")
+        self.params.append(f"{clean}/%")
+        return self
+
+    def type(self, node_type: str):
+        self.conditions.append("n.type = ?")
+        self.params.append(node_type)
+        return self
+
+    def meta_eq(self, key: str, value: Any):
+        self.conditions.append(f"json_extract(n.metadata, '$.{key}') = ?")
+        self.params.append(value)
+        return self
+
+    # --- Tagging & Relationships ---
+
+    def has_tag(self, tag: str):
+        if "tags t" not in self.tables:
+            self.tables.append("JOIN tags t ON n.uuid = t.node_uuid")
+        self.conditions.append("t.tag = ?")
+        self.params.append(tag.lower())
+        self.distinct = True
+        return self
+
+    def related_to(self, target_path: str, relation: str = None):
+        """
+        Finds nodes that directly point to the target.
+        Example: Find records AUTHORED_BY 'people/araki'.
+        """
+        target_uuid = self.db._resolve_path(target_path)
+        if not target_uuid:
+            # If target doesn't exist, query returns nothing
+            self.conditions.append("1=0") 
+            return self
+
+        # Join the edges table
+        # Alias 'e_direct' allows multiple relationship joins if needed
+        alias = f"e_{len(self.tables)}" 
+        self.tables.append(f"JOIN edges {alias} ON n.uuid = {alias}.source_uuid")
+        
+        self.conditions.append(f"{alias}.target_uuid = ?")
+        self.params.append(target_uuid)
+
+        if relation:
+            self.conditions.append(f"{alias}.relation = ?")
+            self.params.append(relation)
+        
+        self.distinct = True
+        return self
+
+    def contains_related(self, target_path: str, relation: str = None):
+        """
+        Finds Vaults that contain ANY child (recursively) that is related to the target.
+        Example: Find all Vaults containing records DRAWN_BY 'araki'.
+        """
+        target_uuid = self.db._resolve_path(target_path)
+        if not target_uuid:
+            self.conditions.append("1=0")
+            return self
+
+        # We use an EXISTS subquery for efficiency with the hierarchical path
+        # Logic: Select * from nodes n WHERE EXISTS (
+        #    SELECT 1 FROM nodes child 
+        #    JOIN edges e ON child.uuid = e.source_uuid
+        #    WHERE child.cached_path LIKE n.cached_path || '/%' 
+        #    AND e.target_uuid = ...
+        # )
+        
+        subquery = """
+        EXISTS (
+            SELECT 1 FROM nodes child
+            JOIN edges e ON child.uuid = e.source_uuid
+            WHERE child.cached_path LIKE n.cached_path || '/%'
+            AND e.target_uuid = ?
+        """
+        
+        sub_params = [target_uuid]
+
+        if relation:
+            subquery += " AND e.relation = ?"
+            sub_params.append(relation)
+
+        subquery += ")"
+
+        self.conditions.append(subquery)
+        self.params.extend(sub_params)
+        
+        # Usually only Vaults contain things, but we don't strictly enforce it 
+        # unless user calls .type('VAULT')
+        return self
+
+    # --- Execution ---
+
+    def execute(self) -> List[Dict]:
+        base = "SELECT DISTINCT n.uuid, n.cached_path, n.type, n.metadata FROM " if self.distinct else "SELECT n.uuid, n.cached_path, n.type, n.metadata FROM "
+        query_str = base + " ".join(self.tables)
+        
+        if self.conditions:
+            query_str += " WHERE " + " AND ".join(self.conditions)
+        
+        query_str += " ORDER BY n.cached_path ASC"
+
+        # print(f"DEBUG SQL: {query_str} | Params: {self.params}") # Uncomment for debugging
+        
+        cursor = self.conn.execute(query_str, self.params)
+        results = []
+        for row in cursor:
+            results.append({
+                "uuid": row[0],
+                "path": row[1],
+                "type": row[2],
+                "metadata": json.loads(row[3]) if row[3] else {}
+            })
+        return results
