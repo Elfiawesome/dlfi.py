@@ -15,7 +15,8 @@ class PoipikuExtractor(BaseExtractor):
 
     def default_config(self) -> dict:
         return {
-            "password": None
+            "password": None,
+            "password_list": None
         }
 
     def can_handle(self, url: str) -> bool:
@@ -32,9 +33,29 @@ class PoipikuExtractor(BaseExtractor):
             if len(match) == 2:
                 yield from self.extract_post(match[0], match[1], extr_config)
     
+    def extract_profile(self, user_id: str, extr_config: dict = {}) -> Generator[DiscoveredNode, None, None]:
+        pass
+
     def extract_post(self, user_id: str, post_id: str, extr_config: dict = {}) -> Generator[DiscoveredNode, None, None]:
         logger.info(f"[{self.name}] Processing Post: {user_id} / {post_id}")
         
+        if 'password_list' in extr_config:
+            password_list = extr_config['password_list']
+            success = False
+            for _pass in password_list:
+                try:
+                    yield from self._extract_post(user_id, post_id, extr_config | {"password": _pass})
+                    success = True
+                    break
+                except Exception as e:
+                    logger.info("Failed to extract, trying a different password...")
+            if success == False:
+                raise Exception("Failed to extract post with all passwords")          
+        else:
+            yield from self._extract_post(user_id, post_id, extr_config)
+
+
+    def _extract_post(self, user_id: str, post_id: str, extr_config: dict) -> Generator[DiscoveredNode, None, None]:
         # Fetch the metadata/HTML to find image links
         req_data = {
             "ID": user_id,
