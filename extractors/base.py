@@ -2,9 +2,12 @@ import os
 import requests
 import tempfile
 import http.cookiejar
+import logging
 from abc import ABC, abstractmethod
 from typing import Generator, Optional
 from dlfi.models import DiscoveredNode
+
+logger = logging.getLogger(__name__)
 
 class BaseExtractor(ABC):
     def __init__(self):
@@ -28,11 +31,11 @@ class BaseExtractor(ABC):
                 jar = http.cookiejar.MozillaCookieJar(cookie_file)
                 jar.load(ignore_discard=True, ignore_expires=True)
                 self.session.cookies.update(jar)
-                print(f"[{self.name}] Loaded cookies from {cookie_file}")
+                logger.info(f"[{self.name}] Loaded cookies from {cookie_file}")
             except Exception as e:
-                print(f"[{self.name}] Failed to load cookies: {e}")
+                logger.warning(f"[{self.name}] Failed to load cookies file: {e}")
         else:
-            print(f"[{self.name}] No cookies file found: {cookie_file}")
+            logger.warning(f"[{self.name}] Cookie file path provided but not found: {cookie_file}")
 
 
     def download_to_temp(self, url: str, filename_hint: str = "file") -> str:
@@ -40,7 +43,7 @@ class BaseExtractor(ABC):
         Downloads a file synchronously to a temporary location.
         Returns the path to the temp file.
         """
-        print(f"[{self.name}] Downloading: {url}")
+        logger.info(f"[{self.name}] Downloading temp: {url}")
         
         with self.session.get(url, stream=True) as r:
             r.raise_for_status()
@@ -71,7 +74,11 @@ class BaseExtractor(ABC):
         pass
 
     @abstractmethod
-    def extract(self, url: str) -> Generator[DiscoveredNode, None, None]:
+    def default_config(self) -> dict:
+        return {}
+
+    @abstractmethod
+    def extract(self, url: str, extr_config: dict = {}) -> Generator[DiscoveredNode, None, None]:
         """
         The main logic. Yields DiscoveredNode objects.
         """

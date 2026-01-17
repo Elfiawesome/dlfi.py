@@ -1,68 +1,88 @@
 import re
+import logging
 from typing import Generator
 from .base import BaseExtractor
 from dlfi.models import DiscoveredNode, DiscoveredFile
+
+logger = logging.getLogger(__name__)
 
 class PoipikuExtractor(BaseExtractor):
     name = "Poipiku"
     slug = "poipiku"
     URL_PATTERN = re.compile(r'poipiku\.com\/(\d+)(?:\/(\d+)\.html)?')
     CDN_PATTERN = re.compile(r'\"(https:\/\/cdn\.poipiku\.com\/.*?)\"')
+    DETAIL_LINK = "https://poipiku.com/f/ShowIllustDetailF.jsp"
+
+    def default_config(self) -> dict:
+        return {
+            "password": None
+        }
 
     def can_handle(self, url: str) -> bool:
         if self.URL_PATTERN.search(url):
             return True
         return False
     
-    def extract(self, url: str) -> Generator[DiscoveredNode, None, None]:
+    def extract(self, url: str, extr_config: dict = {}) -> Generator[DiscoveredNode, None, None]:
         matches = self.URL_PATTERN.findall(url)
         for match in matches:
             if len(match) == 1:
                 # TODO: Handle user profile pages
                 pass
             if len(match) == 2:
-                yield from self.extract_post(match[0], match[1])
+                yield from self.extract_post(match[0], match[1], extr_config)
     
-    def extract_post(self, user_id: str, post_id: str) -> Generator[DiscoveredNode, None, None]:
-        print(f"[{self.name}] {user_id} - {post_id}")
+    def extract_post(self, user_id: str, post_id: str, extr_config: dict = {}) -> Generator[DiscoveredNode, None, None]:
+        logger.info(f"[{self.name}] Processing Post: {user_id} / {post_id}")
         
         # Fetch the metadata/HTML to find image links
-        req = self.session.request("POST", "https://poipiku.com/f/ShowIllustDetailF.jsp", data={
+        req_data = {
             "ID": user_id,
             "TD": post_id,
             "AD": -1,
-            "PAS": None
-        }, headers={
+            "PAS": extr_config["password"]
+        }
+        req_headers = {
             "Origin":"https://poipiku.com",
             "referer": f"https://poipiku.com/{user_id}/{post_id}.html"
-        })
+        }
+        req = self.session.request("POST", self.DETAIL_LINK, data=req_data, headers=req_headers)
+
+        data = None
+        try:
+            req.raise_for_status()
+            data = req.json()
+            if not data:
+                raise Exception("No data returned")
+        except Exception as e:
+            logger.error(f"Failed to fetch metadata for {post_id}: {e}")
+            raise
         
-        data = req.json()
-        if data:
-            post_num = 0
-            for img_link in self.CDN_PATTERN.findall(data['html']):
-                img_url = str(img_link)
-                
-                # 1. Initiate Stream
-                # We do not read the content here; we pass the open connection to DLFI.
+        if data['result'] != 1:
+            raise Exception(f"Failed to correctly fetch metadata with data {data}")
+
+        post_num = 0
+        for img_link in self.CDN_PATTERN.findall(data['html']):
+            img_url = str(img_link)
+            
+            try:
                 response = self.session.get(img_url, stream=True)
                 response.raise_for_status()
-                # Ensure the stream decodes gzip/deflate if necessary
                 response.raw.decode_content = True
 
-                # 2. Determine Filename
                 ext = "." + img_url.split("?")[0].split(".")[-1]
                 filename = f"{user_id}_{post_id}_{post_num}{ext}"
 
-                # 3. Yield Node with Stream
                 yield DiscoveredNode(
-                    suggested_path=f"poipiku/users/{filename}",
+                    suggested_path=f"poipiku/users/{user_id}/{filename}",
                     node_type="RECORD",
-                    metadata={"password":""},
+                    metadata={"password": extr_config["password"]},
                     files=[DiscoveredFile(
                         stream=response.raw, 
                         original_name=filename,
                         source_url=img_url
                     )]
                 )
-                post_num += 1
+            except Exception as e:
+                raise e
+            post_num += 1

@@ -6,8 +6,11 @@ import uuid
 import shutil
 import time
 import tempfile
+import logging
 from pathlib import Path
 from typing import Optional, Dict, List, Any, IO
+
+logger = logging.getLogger(__name__)
 
 class DLFI:
     def __init__(self, archive_root: str):
@@ -42,7 +45,7 @@ class DLFI:
             except OSError:
                 pass
 
-        print(f"[DLFI] Initialized storage at {self.storage_dir}")
+        logger.info(f"Initialized storage at {self.storage_dir}")
 
     def _get_connection(self) -> sqlite3.Connection:
         """Returns a tuned SQLite connection."""
@@ -178,8 +181,12 @@ class DLFI:
         final_name = filename_override if filename_override else file_path.name
         
         # 3. Calculate Hash
-        file_hash = self.get_file_hash(str(file_path))
-        file_size = file_path.stat().st_size
+        try:
+            file_hash = self.get_file_hash(str(file_path))
+            file_size = file_path.stat().st_size
+        except PermissionError:
+            logger.error(f"Permission denied reading: {file_path}")
+            raise
         
         self._store_blob_and_link(node_uuid, file_hash, file_size, final_name, source_path=file_path)
 
@@ -212,6 +219,7 @@ class DLFI:
                 tmp_file.close()
                 if tmp_path.exists():
                     os.remove(tmp_path)
+                logger.error(f"Stream interrupted for {filename}: {e}")
                 raise e
 
         file_hash = sha256.hexdigest()
@@ -257,9 +265,11 @@ class DLFI:
                     INSERT INTO blobs (hash, ext, size_bytes, storage_path)
                     VALUES (?, ?, ?, ?)
                 """, (file_hash, ext, file_size, rel_path))
+                logger.debug(f"Stored new blob: {file_hash[:8]}... ({filename})")
             else:
                 # Deduplication: Blob exists. 
                 # If it was a temp file (stream), we don't need it anymore.
+                logger.debug(f"Deduplicated blob: {file_hash[:8]}...")
                 if is_temp and source_path.exists():
                     os.remove(source_path)
 
@@ -362,18 +372,21 @@ class DLFI:
         """
         out_path = Path(output_dir).resolve()
         if out_path.exists():
-            print(f"[Export] Cleaning previous export at {out_path}...")
-            shutil.rmtree(out_path)
+            logger.info(f"Cleaning previous export at {out_path}...")
+            try:
+                shutil.rmtree(out_path)
+            except OSError as e:
+                logger.error(f"Failed to clean export directory: {e}")
+                raise
         os.makedirs(out_path)
 
-        print("[Export] Building UUID lookup map...")
+        logger.info("Building UUID lookup map...")
         # 1. Build a memory map of UUID -> Path for fast relationship resolution
         uuid_to_path = {}
         cursor = self.conn.execute("SELECT uuid, cached_path FROM nodes")
         for row in cursor:
             uuid_to_path[row[0]] = row[1]
 
-        print("[Export] Generating hierarchy and files...")
         # 2. Iterate all nodes and build structure
         # We fetch everything needed for the meta.json in one go per node would be ideal, 
         # but for simplicity/readability we will query per node.
@@ -423,7 +436,7 @@ class DLFI:
                     shutil.copy2(src_blob, dst_file)
                     files_list.append(orig_name)
                 else:
-                    print(f"[Warning] Blob missing: {blob_rel_path}")
+                    logger.warning(f"Blob missing for {orig_name}: {blob_rel_path}")
 
             meta_dict['files'] = files_list
 
@@ -432,11 +445,10 @@ class DLFI:
                 json.dump(meta_dict, f, indent=2)
 
         # 3. Create Global Index (for Search/Frontend)
-        print("[Export] creating index.json...")
         with open(out_path / "index.json", "w", encoding='utf-8') as f:
             json.dump(uuid_to_path, f, indent=2)
         
-        print(f"[Export] Complete. Data available in {out_path}")
+        logger.info(f"Export Complete. Data available in {out_path}")
 
     def query(self) -> 'QueryBuilder':
         """Returns a fluent Query Builder."""
