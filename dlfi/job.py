@@ -1,4 +1,5 @@
 from .core import DLFI
+from pathlib import Path
 import extractors
 from dataclasses import dataclass
 import logging
@@ -66,4 +67,7 @@ class Job:
 
 @dataclass
 class JobConfig():
-	cookies: str = None
+	cookies: Path = None
+
+	def __init__(self, cookies: str):
+		self.cookies = Path(cookies).resolve()

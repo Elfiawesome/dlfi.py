@@ -16,6 +16,8 @@ class PoipikuExtractor(BaseExtractor):
     DESC_PATTERN = re.compile(r'class=[\"\']IllustItemDesc[\"\'][^>]*>(.*?)<\/', re.IGNORECASE | re.DOTALL)
     TAG_PATTERN = re.compile(r'class=[\"\']TagName[\"\'][^>]*>(.*?)<\/', re.IGNORECASE)
 
+    USERNAME_PATTERN = re.compile(r'class=[\"\']UserInfoUserName[\"\']\>?[\s\S]\<a href=".+">(.+)<\/a>')
+
     DETAIL_ENDPOINT = "https://poipiku.com/f/ShowIllustDetailF.jsp"
 
     def default_config(self) -> dict:
@@ -34,11 +36,27 @@ class PoipikuExtractor(BaseExtractor):
             return
 
         user_id, post_id = match.groups()
-
+        yield from self.process_profile_data(user_id, extr_config)
         if post_id:
             yield from self.process_post(user_id, post_id, cfg)
         else:
             yield from self.process_profile(user_id, cfg)
+    
+    def process_profile_data(self, user_id: str, config: dict) -> Generator[DiscoveredNode, None, None]:
+        logger.info(f"[{self.name}] Processing profile Data: {user_id}")
+        url = f"https://poipiku.com/{user_id}/"
+        resp = self._request("GET", url)
+        
+        username = ""
+        username_matches = self.USERNAME_PATTERN.findall(resp.text)
+        if not username_matches:
+            username = username_matches[0]
+
+        yield DiscoveredNode(
+            suggested_path=f"poipiku/users/{user_id}",
+            node_type="VAULT",
+            metadata={"username": username},
+        )
     
     def process_profile(self, user_id: str, config: dict) -> Generator[DiscoveredNode, None, None]:
         logger.info(f"[{self.name}] Scanning profile: {user_id}")

@@ -12,7 +12,7 @@ if __name__ == "__main__":
     try:
         db = DLFI(ARCHIVE_DIR)
 
-        job = Job(JobConfig("C:/Users/elfia/OneDrive/Desktop/DLFI.py/.archive/cookies/cookies.txt"))
+        job = Job(JobConfig(".secret/cookies.txt"))
         job.db = db
         
         job.run("https://poipiku.com/379309/1806892.html")
