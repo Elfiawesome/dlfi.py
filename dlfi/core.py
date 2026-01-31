@@ -10,34 +10,64 @@ import logging
 from pathlib import Path
 from typing import Optional, Dict, List, Any, IO
 
+from .crypto import VaultCrypto
+from .partition import FilePartitioner
+from .config import VaultConfig, VaultConfigManager
+
 logger = logging.getLogger(__name__)
 
+
 class DLFI:
-	def __init__(self, archive_root: str):
+	def __init__(self, archive_root: str, password: Optional[str] = None):
 		"""
 		Initialize the Archive System.
 		:param archive_root: Path to the root directory of your archive.
+		:param password: Password for encrypted vaults (required if vault is encrypted).
 		"""
 		self.root = Path(archive_root).resolve()
 		self.system_dir = self.root / ".dlfi"
-		self.storage_dir = self.system_dir / "storage"
-		self.temp_dir = self.system_dir / "temp" # Intermediate area for streams
+		self.storage_dir = self.root / "blobs"  # Shared blob storage (outside .dlfi)
+		self.temp_dir = self.system_dir / "temp"
 		self.db_path = self.system_dir / "db.sqlite"
-
+		self.config_path = self.system_dir / "config.json"
+		
 		# Initialize directories
 		self._initialize_structure()
+		
+		# Load or create config
+		self.config = VaultConfig.load(self.config_path)
+		
+		# Initialize crypto
+		if self.config.encrypted:
+			if not password:
+				raise ValueError("Password required for encrypted vault")
+			if not self.config.salt:
+				raise ValueError("Encrypted vault missing salt in config")
+			self.crypto = VaultCrypto.from_salt_b64(password, self.config.salt)
+		else:
+			self.crypto = VaultCrypto(password=password) if password else VaultCrypto()
+			if password and not self.config.encrypted:
+				# New vault with password - enable encryption
+				self.config.encrypted = True
+				self.config.salt = self.crypto.get_salt_b64()
+				self.config.save(self.config_path)
+		
+		# Initialize partitioner
+		self.partitioner = FilePartitioner(chunk_size=self.config.partition_size)
 		
 		# Connect to DB
 		self.conn = self._get_connection()
 		self._initialize_schema()
+		
+		# Config manager for runtime changes
+		self._config_manager = None
 
 	def _initialize_structure(self):
-		"""Creates the .dlfi hidden folders if they don't exist."""
-		if not self.storage_dir.exists():
-			os.makedirs(self.storage_dir, exist_ok=True)
-		if not self.temp_dir.exists():
-			os.makedirs(self.temp_dir, exist_ok=True)
-			
+		"""Creates the archive structure if it doesn't exist."""
+		os.makedirs(self.system_dir, exist_ok=True)
+		os.makedirs(self.storage_dir, exist_ok=True)
+		os.makedirs(self.temp_dir, exist_ok=True)
+		
 		# Clean stale temp files from previous runs
 		for tmp_file in self.temp_dir.glob("*"):
 			try:
@@ -45,16 +75,13 @@ class DLFI:
 			except OSError:
 				pass
 
-		logger.info(f"Initialized storage at {self.storage_dir}")
+		logger.info(f"Initialized archive at {self.root}")
 
 	def _get_connection(self) -> sqlite3.Connection:
 		"""Returns a tuned SQLite connection."""
 		conn = sqlite3.connect(self.db_path)
-		# OPTIMIZATION: Enable Write-Ahead Logging for concurrency and speed
 		conn.execute("PRAGMA journal_mode=WAL;")
-		# OPTIMIZATION: Faster writes, safe enough for local single-user
 		conn.execute("PRAGMA synchronous=NORMAL;")
-		# Enable Foreign Keys
 		conn.execute("PRAGMA foreign_keys=ON;")
 		return conn
 
@@ -68,14 +95,13 @@ class DLFI:
 					parent_uuid TEXT,
 					type TEXT CHECK(type IN ('VAULT', 'RECORD')) NOT NULL,
 					name TEXT NOT NULL,
-					cached_path TEXT UNIQUE, 
+					cached_path TEXT UNIQUE,
 					metadata JSON,
 					created_at REAL,
 					last_modified REAL,
 					FOREIGN KEY(parent_uuid) REFERENCES nodes(uuid) ON DELETE CASCADE
 				);
 			""")
-			# Index for fast path lookups and child traversals
 			self.conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_parent ON nodes(parent_uuid);")
 			self.conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_path ON nodes(cached_path);")
 
@@ -85,7 +111,8 @@ class DLFI:
 					hash TEXT PRIMARY KEY,
 					ext TEXT,
 					size_bytes INTEGER,
-					storage_path TEXT
+					storage_path TEXT,
+					part_count INTEGER DEFAULT 0
 				);
 			""")
 
@@ -131,20 +158,33 @@ class DLFI:
 			self.conn.execute("CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag);")
 
 	def close(self):
+		"""Close the database connection."""
 		self.conn.close()
 
-	# --- Helper: Hashing for Efficiency ---
+	@property
+	def config_manager(self) -> VaultConfigManager:
+		"""Get the configuration manager for runtime config changes."""
+		if self._config_manager is None:
+			self._config_manager = VaultConfigManager(self)
+		return self._config_manager
+
+	# --- Helper: Hashing ---
 	@staticmethod
 	def get_file_hash(filepath: str) -> str:
 		"""Stream the file to calculate SHA256 without loading into RAM."""
 		sha256 = hashlib.sha256()
 		with open(filepath, 'rb') as f:
 			while True:
-				data = f.read(65536) # 64kb chunks
+				data = f.read(65536)
 				if not data:
 					break
 				sha256.update(data)
 		return sha256.hexdigest()
+
+	@staticmethod
+	def get_bytes_hash(data: bytes) -> str:
+		"""Calculate SHA256 of bytes."""
+		return hashlib.sha256(data).hexdigest()
 
 	# --- WRITE OPERATIONS: Vaults & Records ---
 
@@ -166,114 +206,105 @@ class DLFI:
 	def append_file(self, record_path: str, file_path: str, filename_override: str = None):
 		"""
 		Appends a local file to a record.
-		This optimizes for local files by checking hash before copying.
 		"""
 		file_path = Path(file_path)
 		if not file_path.exists():
 			raise FileNotFoundError(f"File not found: {file_path}")
 
-		# 1. Get Node UUID
 		node_uuid = self._resolve_path(record_path, create_if_missing=False)
 		if not node_uuid:
 			raise ValueError(f"Record not found: {record_path}")
 
-		# 2. Determine Archival Filename
 		final_name = filename_override if filename_override else file_path.name
 		
-		# 3. Calculate Hash
-		try:
-			file_hash = self.get_file_hash(str(file_path))
-			file_size = file_path.stat().st_size
-		except PermissionError:
-			logger.error(f"Permission denied reading: {file_path}")
-			raise
+		# Read and hash plaintext
+		with open(file_path, 'rb') as f:
+			plaintext = f.read()
 		
-		self._store_blob_and_link(node_uuid, file_hash, file_size, final_name, source_path=file_path)
+		file_hash = self.get_bytes_hash(plaintext)
+		file_size = len(plaintext)
+		
+		self._store_blob_and_link(node_uuid, file_hash, file_size, final_name, plaintext)
 
 	def append_stream(self, record_path: str, file_stream: IO[bytes], filename: str):
 		"""
-		Appends a data stream (e.g. requests.raw or open file) to a record.
-		It saves to a temp file while calculating hash, then moves to storage if unique.
+		Appends a data stream to a record.
 		"""
-		# 1. Get Node UUID
 		node_uuid = self._resolve_path(record_path, create_if_missing=False)
 		if not node_uuid:
 			raise ValueError(f"Record not found: {record_path}")
 
-		# 2. Stream to Temp & Hash
+		# Stream to memory while hashing (for plaintext hash)
 		sha256 = hashlib.sha256()
-		file_size = 0
+		chunks = []
 		
-		# Use temp dir inside .dlfi so os.rename works atomically (same filesystem)
-		with tempfile.NamedTemporaryFile(mode='wb', dir=self.temp_dir, delete=False) as tmp_file:
-			tmp_path = Path(tmp_file.name)
-			try:
-				while True:
-					chunk = file_stream.read(65536) # 64KB chunks
-					if not chunk:
-						break
-					sha256.update(chunk)
-					tmp_file.write(chunk)
-					file_size += len(chunk)
-			except Exception as e:
-				tmp_file.close()
-				if tmp_path.exists():
-					os.remove(tmp_path)
-				logger.error(f"Stream interrupted for {filename}: {e}")
-				raise e
-
-		file_hash = sha256.hexdigest()
-		
-		# 3. Store (Move Temp) & Link
 		try:
-			self._store_blob_and_link(node_uuid, file_hash, file_size, filename, source_path=tmp_path, is_temp=True)
+			while True:
+				chunk = file_stream.read(65536)
+				if not chunk:
+					break
+				sha256.update(chunk)
+				chunks.append(chunk)
 		except Exception as e:
-			# Cleanup temp if something went wrong in DB logic, though _store usually handles it
-			if tmp_path.exists():
-				os.remove(tmp_path)
-			raise e
+			logger.error(f"Stream interrupted for {filename}: {e}")
+			raise
 
-	def _store_blob_and_link(self, node_uuid: str, file_hash: str, file_size: int, filename: str, source_path: Path, is_temp: bool = False):
+		plaintext = b''.join(chunks)
+		file_hash = sha256.hexdigest()
+		file_size = len(plaintext)
+		
+		self._store_blob_and_link(node_uuid, file_hash, file_size, filename, plaintext)
+
+	def _store_blob_and_link(self, node_uuid: str, file_hash: str, file_size: int, 
+							filename: str, plaintext: bytes):
 		"""
-		Internal: Handles the DB logic for blobs and linking.
-		:param is_temp: If True, source_path is moved/deleted. If False, source_path is copied.
+		Internal: Handles blob storage with encryption and partitioning.
+		Hash is of PLAINTEXT for deduplication.
 		"""
 		ext = Path(filename).suffix.lower().lstrip('.')
 
 		with self.conn:
-			# 1. Check if Blob exists in DB
+			# Check if blob exists (deduplication by plaintext hash)
 			cursor = self.conn.execute("SELECT hash FROM blobs WHERE hash = ?", (file_hash,))
 			if not cursor.fetchone():
+				# Encrypt if enabled
+				if self.crypto.enabled:
+					data_to_store = self.crypto.encrypt(plaintext)
+				else:
+					data_to_store = plaintext
+				
+				# Determine storage location
 				shard_a = file_hash[:2]
 				shard_b = file_hash[2:4]
 				storage_subdir = self.storage_dir / shard_a / shard_b
 				os.makedirs(storage_subdir, exist_ok=True)
 				
-				target_path = storage_subdir / file_hash
-				
-				# Physical File Operation
-				if is_temp:
-					# Move (Atomic on same FS)
-					shutil.move(str(source_path), str(target_path))
+				# Handle partitioning
+				part_count = 0
+				if self.partitioner.needs_partitioning(len(data_to_store)):
+					parts = self.partitioner.split_bytes(data_to_store)
+					part_count = len(parts)
+					for i, part_data in enumerate(parts, 1):
+						part_path = storage_subdir / f"{file_hash}.{i:03d}"
+						with open(part_path, 'wb') as f:
+							f.write(part_data)
+					logger.debug(f"Stored blob {file_hash[:8]}... in {part_count} parts")
 				else:
-					# Copy
-					shutil.copy2(source_path, target_path)
+					target_path = storage_subdir / file_hash
+					with open(target_path, 'wb') as f:
+						f.write(data_to_store)
+					logger.debug(f"Stored new blob: {file_hash[:8]}... ({filename})")
 
-				# Insert Blob Record
+				# Insert blob record
 				rel_path = f"{shard_a}/{shard_b}/{file_hash}"
 				self.conn.execute("""
-					INSERT INTO blobs (hash, ext, size_bytes, storage_path)
-					VALUES (?, ?, ?, ?)
-				""", (file_hash, ext, file_size, rel_path))
-				logger.debug(f"Stored new blob: {file_hash[:8]}... ({filename})")
+					INSERT INTO blobs (hash, ext, size_bytes, storage_path, part_count)
+					VALUES (?, ?, ?, ?, ?)
+				""", (file_hash, ext, file_size, rel_path, part_count))
 			else:
-				# Deduplication: Blob exists. 
-				# If it was a temp file (stream), we don't need it anymore.
 				logger.debug(f"Deduplicated blob: {file_hash[:8]}...")
-				if is_temp and source_path.exists():
-					os.remove(source_path)
 
-			# 2. Link Blob to Node
+			# Link blob to node
 			cur = self.conn.execute("SELECT COUNT(*) FROM node_files WHERE node_uuid = ?", (node_uuid,))
 			count = cur.fetchone()[0]
 			
@@ -283,18 +314,53 @@ class DLFI:
 			""", (node_uuid, file_hash, filename, count + 1, time.time()))
 			
 			self.conn.execute("UPDATE nodes SET last_modified = ? WHERE uuid = ?", (time.time(), node_uuid))
-	
-	# --- INTERNAL: Path Resolution Logic ---
+
+	def read_blob(self, file_hash: str) -> Optional[bytes]:
+		"""
+		Read and decrypt a blob by its hash.
+		Returns plaintext bytes or None if not found.
+		"""
+		cursor = self.conn.execute(
+			"SELECT storage_path, part_count FROM blobs WHERE hash = ?", (file_hash,)
+		)
+		row = cursor.fetchone()
+		if not row:
+			return None
+		
+		storage_path, part_count = row
+		
+		# Read data (handle partitions)
+		if part_count > 0:
+			parts = FilePartitioner.get_part_files(self.storage_dir, file_hash)
+			data = bytearray()
+			for part in sorted(parts, key=lambda p: p.name):
+				with open(part, 'rb') as f:
+					data.extend(f.read())
+			data = bytes(data)
+		else:
+			blob_path = self.storage_dir / storage_path
+			if not blob_path.exists():
+				return None
+			with open(blob_path, 'rb') as f:
+				data = f.read()
+		
+		# Decrypt if needed
+		if self.crypto.enabled:
+			data = self.crypto.decrypt(data)
+		
+		return data
+
+	# --- Path Resolution ---
 
 	def _resolve_path(self, path: str, create_if_missing=False, node_type='VAULT', metadata=None) -> Optional[str]:
 		"""
-		Converts a path string (e.g., "manga/jojo") into a UUID.
+		Converts a path string into a UUID.
 		If create_if_missing is True, it builds the hierarchy.
 		"""
-		clean_path = path.strip("/").replace("\\", "/") # Normalize
+		clean_path = path.strip("/").replace("\\", "/")
 		parts = clean_path.split("/")
 		
-		current_parent_uuid = None # Root
+		current_parent_uuid = None
 		current_path_str = ""
 
 		for i, part in enumerate(parts):
@@ -303,7 +369,6 @@ class DLFI:
 				current_path_str += "/"
 			current_path_str += part
 
-			# Check if this node exists
 			cursor = self.conn.execute(
 				"SELECT uuid FROM nodes WHERE parent_uuid IS ? AND name = ?", 
 				(current_parent_uuid, part)
@@ -311,16 +376,13 @@ class DLFI:
 			row = cursor.fetchone()
 
 			if row:
-				current_parent_uuid = row[0] # Move down the tree
+				current_parent_uuid = row[0]
 			else:
 				if not create_if_missing:
-					return None # Path doesn't exist
+					return None
 				
-				# Create it
 				new_uuid = str(uuid.uuid4())
-				# Determine type: Intermediate parts are always VAULTs. Last part uses requested type.
 				actual_type = node_type if is_last else 'VAULT'
-				# Only apply metadata to the exact target, not the parents
 				actual_meta = json.dumps(metadata) if (is_last and metadata) else None
 				
 				with self.conn:
@@ -332,19 +394,18 @@ class DLFI:
 				current_parent_uuid = new_uuid
 
 		return current_parent_uuid
-	
-	# --- GRAPH OPERATIONS: Linking & Tagging ---
+
+	# --- GRAPH OPERATIONS ---
 
 	def link(self, source_path: str, target_path: str, relation: str):
-		"""
-		Creates a directed relationship between two nodes.
-		Example: link('manga/jojo', 'people/araki', 'AUTHORED_BY')
-		"""
+		"""Creates a directed relationship between two nodes."""
 		src_uuid = self._resolve_path(source_path)
 		tgt_uuid = self._resolve_path(target_path)
 
-		if not src_uuid: raise ValueError(f"Source path not found: {source_path}")
-		if not tgt_uuid: raise ValueError(f"Target path not found: {target_path}")
+		if not src_uuid: 
+			raise ValueError(f"Source path not found: {source_path}")
+		if not tgt_uuid: 
+			raise ValueError(f"Target path not found: {target_path}")
 
 		with self.conn:
 			self.conn.execute("""
@@ -355,7 +416,8 @@ class DLFI:
 	def add_tag(self, path: str, tag: str):
 		"""Adds a primitive string tag to a node."""
 		node_uuid = self._resolve_path(path)
-		if not node_uuid: raise ValueError(f"Node not found: {path}")
+		if not node_uuid: 
+			raise ValueError(f"Node not found: {path}")
 
 		with self.conn:
 			self.conn.execute("""
@@ -363,97 +425,37 @@ class DLFI:
 				VALUES (?, ?)
 			""", (node_uuid, tag.lower()))
 
-	# --- EXPORT SYSTEM: Static Generation ---
+	# --- STATIC SITE GENERATION ---
 
-	def export(self, output_dir: str):
+	def generate_static_site(self):
 		"""
-		Generates a static file system version of the archive.
-		Returns: The path to the index.json
+		Generates static site files (manifest.json and index.html).
+		Blobs are already in the shared storage folder.
 		"""
-		out_path = Path(output_dir).resolve()
-		if out_path.exists():
-			logger.info(f"Cleaning previous export at {out_path}...")
-			try:
-				shutil.rmtree(out_path)
-			except OSError as e:
-				logger.error(f"Failed to clean export directory: {e}")
-				raise
-		os.makedirs(out_path)
+		from .static import StaticSiteGenerator
+		generator = StaticSiteGenerator(self)
+		generator.generate()
 
-		logger.info("Building UUID lookup map...")
-		# 1. Build a memory map of UUID -> Path for fast relationship resolution
-		uuid_to_path = {}
-		cursor = self.conn.execute("SELECT uuid, cached_path FROM nodes")
-		for row in cursor:
-			uuid_to_path[row[0]] = row[1]
+	# --- LEGACY EXPORT (for backwards compatibility) ---
+	
+	def export(self, output_dir: str = None):
+		"""
+		Generate static site. If output_dir is provided (legacy), logs a warning.
+		Static site is now generated in the archive root.
+		"""
+		if output_dir:
+			logger.warning(
+				"output_dir parameter is deprecated. Static site is generated in archive root. "
+				"Blobs are shared between database and static site."
+			)
+		self.generate_static_site()
 
-		# 2. Iterate all nodes and build structure
-		# We fetch everything needed for the meta.json in one go per node would be ideal, 
-		# but for simplicity/readability we will query per node.
-		nodes_cursor = self.conn.execute("SELECT uuid, type, cached_path, metadata FROM nodes")
-		
-		for n_uuid, n_type, n_path, n_meta in nodes_cursor:
-			# Determine physical path
-			# If it's a RECORD, we make it a FOLDER so it can hold the file + meta.json
-			node_out_dir = out_path / n_path
-			os.makedirs(node_out_dir, exist_ok=True)
-
-			# A. Prepare Metadata
-			meta_dict = json.loads(n_meta) if n_meta else {}
-			meta_dict['uuid'] = n_uuid
-			meta_dict['type'] = n_type
-			
-			# B. Fetch Tags
-			tags_cur = self.conn.execute("SELECT tag FROM tags WHERE node_uuid = ?", (n_uuid,))
-			meta_dict['tags'] = [r[0] for r in tags_cur]
-
-			# C. Fetch Relationships (Outgoing)
-			# We resolve UUIDs back to Paths here so the JSON is human-readable
-			rels = []
-			edges_cur = self.conn.execute("SELECT target_uuid, relation FROM edges WHERE source_uuid = ?", (n_uuid,))
-			for tgt_uuid, rel_name in edges_cur:
-				tgt_path = uuid_to_path.get(tgt_uuid, "UNKNOWN_NODE")
-				rels.append({"relation": rel_name, "target_path": tgt_path})
-			meta_dict['relationships'] = rels
-
-			# D. Handle Files (Only for Records usually, but Vaults can technically have attachments in this logic)
-			files_list = []
-			files_cur = self.conn.execute("""
-				SELECT nf.original_name, b.storage_path 
-				FROM node_files nf 
-				JOIN blobs b ON nf.file_hash = b.hash 
-				WHERE nf.node_uuid = ? 
-				ORDER BY nf.display_order
-			""", (n_uuid,))
-			
-			for orig_name, blob_rel_path in files_cur:
-				# Copy physical file
-				src_blob = self.storage_dir / blob_rel_path
-				dst_file = node_out_dir / orig_name
-				
-				# Copy if exists (it should)
-				if src_blob.exists():
-					shutil.copy2(src_blob, dst_file)
-					files_list.append(orig_name)
-				else:
-					logger.warning(f"Blob missing for {orig_name}: {blob_rel_path}")
-
-			meta_dict['files'] = files_list
-
-			# E. Write _meta.json
-			with open(node_out_dir / "_meta.json", "w", encoding='utf-8') as f:
-				json.dump(meta_dict, f, indent=2)
-
-		# 3. Create Global Index (for Search/Frontend)
-		with open(out_path / "index.json", "w", encoding='utf-8') as f:
-			json.dump(uuid_to_path, f, indent=2)
-		
-		logger.info(f"Export Complete. Data available in {out_path}")
+	# --- QUERY BUILDER ---
 
 	def query(self) -> 'QueryBuilder':
 		"""Returns a fluent Query Builder."""
-		# Import here or rely on the class being defined in the same file
 		return QueryBuilder(self)
+
 
 class QueryBuilder:
 	def __init__(self, dlfi_instance):
@@ -463,8 +465,6 @@ class QueryBuilder:
 		self.params = []
 		self.tables = ["nodes n"]
 		self.distinct = False
-
-	# --- Basic Filters ---
 
 	def inside(self, path_prefix: str):
 		clean = path_prefix.strip("/")
@@ -482,8 +482,6 @@ class QueryBuilder:
 		self.params.append(value)
 		return self
 
-	# --- Tagging & Relationships ---
-
 	def has_tag(self, tag: str):
 		if "tags t" not in self.tables:
 			self.tables.append("JOIN tags t ON n.uuid = t.node_uuid")
@@ -493,19 +491,13 @@ class QueryBuilder:
 		return self
 
 	def related_to(self, target_path: str, relation: str = None):
-		"""
-		Finds nodes that directly point to the target.
-		Example: Find records AUTHORED_BY 'people/araki'.
-		"""
+		"""Finds nodes that directly point to the target."""
 		target_uuid = self.db._resolve_path(target_path)
 		if not target_uuid:
-			# If target doesn't exist, query returns nothing
-			self.conditions.append("1=0") 
+			self.conditions.append("1=0")
 			return self
 
-		# Join the edges table
-		# Alias 'e_direct' allows multiple relationship joins if needed
-		alias = f"e_{len(self.tables)}" 
+		alias = f"e_{len(self.tables)}"
 		self.tables.append(f"JOIN edges {alias} ON n.uuid = {alias}.source_uuid")
 		
 		self.conditions.append(f"{alias}.target_uuid = ?")
@@ -519,23 +511,12 @@ class QueryBuilder:
 		return self
 
 	def contains_related(self, target_path: str, relation: str = None):
-		"""
-		Finds Vaults that contain ANY child (recursively) that is related to the target.
-		Example: Find all Vaults containing records DRAWN_BY 'araki'.
-		"""
+		"""Finds Vaults containing any child related to the target."""
 		target_uuid = self.db._resolve_path(target_path)
 		if not target_uuid:
 			self.conditions.append("1=0")
 			return self
 
-		# We use an EXISTS subquery for efficiency with the hierarchical path
-		# Logic: Select * from nodes n WHERE EXISTS (
-		#    SELECT 1 FROM nodes child 
-		#    JOIN edges e ON child.uuid = e.source_uuid
-		#    WHERE child.cached_path LIKE n.cached_path || '/%' 
-		#    AND e.target_uuid = ...
-		# )
-		
 		subquery = """
 		EXISTS (
 			SELECT 1 FROM nodes child
@@ -554,12 +535,7 @@ class QueryBuilder:
 
 		self.conditions.append(subquery)
 		self.params.extend(sub_params)
-		
-		# Usually only Vaults contain things, but we don't strictly enforce it 
-		# unless user calls .type('VAULT')
 		return self
-
-	# --- Execution ---
 
 	def execute(self) -> List[Dict]:
 		base = "SELECT DISTINCT n.uuid, n.cached_path, n.type, n.metadata FROM " if self.distinct else "SELECT n.uuid, n.cached_path, n.type, n.metadata FROM "
@@ -569,8 +545,6 @@ class QueryBuilder:
 			query_str += " WHERE " + " AND ".join(self.conditions)
 		
 		query_str += " ORDER BY n.cached_path ASC"
-
-		# print(f"DEBUG SQL: {query_str} | Params: {self.params}") # Uncomment for debugging
 		
 		cursor = self.conn.execute(query_str, self.params)
 		results = []
