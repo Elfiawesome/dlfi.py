@@ -10,31 +10,70 @@ if __name__ == "__main__":
 	
 	db = None
 	try:
-		# Initialize archive with optional encryption
-		# Pass password=None for unencrypted, or password="your_password" for encrypted
-		db = DLFI(ARCHIVE_DIR, password=None)  # Change to enable encryption
+		# Initialize archive
+		# For a NEW encrypted archive: pass password
+		# For an EXISTING encrypted archive: pass the same password
+		# For unencrypted: pass None or omit
+		db = DLFI(ARCHIVE_DIR, password=None)
 		
-		# Example: Enable encryption on existing vault
+		# ============================================================
+		# RUN EXTRACTION JOBS
+		# ============================================================
+		
+		# job = Job(JobConfig(".secret/cookies.txt"))
+		# job.db = db
+		# job.run("https://poipiku.com/379309/1806892.html")
+		# job.run("https://poipiku.com/10085584/", {"password": "yes"})
+
+		# db.create_record("yo")
+		# db.append_file("yo", "C:\\Users\\elfia\\OneDrive\\Desktop\\DLFI.py\\.archive\\vid.mp4")
+
+		# ============================================================
+		# ENCRYPTION EXAMPLES
+		# ============================================================
+		
+		# Enable encryption on an existing unencrypted vault:
 		# db.config_manager.enable_encryption("my_secret_password")
 		
-		# Example: Change partition size (50MB default, set to 0 to disable)
-		# db.config_manager.change_partition_size(25 * 1024 * 1024)  # 25MB chunks
+		# Disable encryption (requires current password):
+		# db.config_manager.disable_encryption("my_secret_password")
 		
-		# Example: Change password
+		# Change password (requires old password):
 		# db.config_manager.change_password("old_password", "new_password")
 		
-		# Run extraction jobs
-		job = Job(JobConfig(".secret/cookies.txt"))
-		job.db = db
+		# ============================================================
+		# PARTITION SIZE EXAMPLES
+		# ============================================================
 		
-		job.run("https://poipiku.com/379309/1806892.html")
-		# job.run("https://poipiku.com/10085584/", {"password": "yes"})
+		# Change to 25MB chunks (for smaller GitHub-friendly files):
+		# db.config_manager.change_partition_size(25 * 1024 * 1024)
+		
+		# Change to 100MB chunks:
+		# db.config_manager.change_partition_size(100 * 1024 * 1024)
+		
+		# Disable partitioning entirely:
+		# db.config_manager.change_partition_size(0)
+		
+		# ============================================================
+		# COMBINED RECONFIGURATION
+		# ============================================================
+		
+		# Change multiple settings at once:
+		# db.config_manager.reconfigure(
+		#     password="current_password",        # Required if currently encrypted
+		#     new_password="new_password",        # Optional: change password
+		#     enable_encryption=True,             # Optional: True/False/None
+		#     partition_size=25 * 1024 * 1024     # Optional: new chunk size
+		# )
 
 		# Generate static site (index.html + manifest.json in archive root)
 		# Blobs are shared - no duplication
 		db.generate_static_site()
 		
-		logging.info(f"Archive ready. Open {ARCHIVE_DIR}/index.html to view.")
+		logging.info(f"Archive ready at: {ARCHIVE_DIR}/")
+		logging.info(f"Open {ARCHIVE_DIR}/index.html in a browser to view.")
+		logging.info(f"Encrypted: {db.config.encrypted}")
+		logging.info(f"Partition size: {db.config.partition_size} bytes")
 
 	except Exception as e:
 		logging.critical("Unhandled application error", exc_info=True)

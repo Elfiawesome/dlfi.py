@@ -1,9 +1,9 @@
 import json
 from pathlib import Path
 from typing import Optional
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
 import logging
-import shutil
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -59,15 +59,70 @@ class VaultConfig:
 
 
 class VaultConfigManager:
-	"""Manages vault configuration changes including re-encryption."""
+	"""Manages vault configuration changes including re-encryption and re-partitioning."""
 	
 	def __init__(self, dlfi_instance):
 		self.dlfi = dlfi_instance
 	
+	def _get_all_blob_hashes(self) -> list:
+		"""Get all blob hashes from database."""
+		cursor = self.dlfi.conn.execute("SELECT hash FROM blobs")
+		return [row[0] for row in cursor.fetchall()]
+	
+	def _read_blob_raw(self, file_hash: str) -> Optional[bytes]:
+		"""Read raw blob data (encrypted or not) from storage."""
+		from .partition import FilePartitioner
+		
+		part_files = FilePartitioner.get_part_files(self.dlfi.storage_dir, file_hash)
+		if not part_files:
+			return None
+		
+		# Read and concatenate all parts
+		data = bytearray()
+		for part in sorted(part_files, key=lambda p: p.name):
+			with open(part, 'rb') as f:
+				data.extend(f.read())
+		
+		return bytes(data)
+	
+	def _write_blob_raw(self, file_hash: str, data: bytes, partitioner) -> int:
+		"""
+		Write raw blob data to storage with given partitioner.
+		Returns the number of parts written.
+		"""
+		shard_a = file_hash[:2]
+		shard_b = file_hash[2:4]
+		blob_dir = self.dlfi.storage_dir / shard_a / shard_b
+		blob_dir.mkdir(parents=True, exist_ok=True)
+		
+		# Remove any existing files for this hash
+		for existing in blob_dir.glob(f"{file_hash}*"):
+			existing.unlink()
+		
+		# Write with partitioning
+		if partitioner.needs_partitioning(len(data)):
+			parts = partitioner.split_bytes(data)
+			for i, part_data in enumerate(parts, 1):
+				part_path = blob_dir / f"{file_hash}.{i:03d}"
+				with open(part_path, 'wb') as f:
+					f.write(part_data)
+			return len(parts)
+		else:
+			with open(blob_dir / file_hash, 'wb') as f:
+				f.write(data)
+			return 0
+	
+	def _update_blob_part_count(self, file_hash: str, part_count: int):
+		"""Update part_count in database."""
+		self.dlfi.conn.execute(
+			"UPDATE blobs SET part_count = ? WHERE hash = ?",
+			(part_count, file_hash)
+		)
+	
 	def enable_encryption(self, password: str) -> bool:
 		"""
 		Enable encryption on an existing vault.
-		Re-encrypts all blobs and updates config.
+		Encrypts all existing blobs and updates config.
 		"""
 		from .crypto import VaultCrypto
 		
@@ -75,13 +130,43 @@ class VaultConfigManager:
 			logger.error("Vault is already encrypted")
 			return False
 		
+		if not password:
+			logger.error("Password is required to enable encryption")
+			return False
+		
 		logger.info("Enabling encryption on vault...")
 		
 		# Create new crypto instance
 		new_crypto = VaultCrypto(password=password)
 		
-		# Re-encrypt all blobs
-		self._reprocess_blobs(old_crypto=None, new_crypto=new_crypto)
+		# Process all blobs
+		blob_hashes = self._get_all_blob_hashes()
+		total = len(blob_hashes)
+		
+		logger.info(f"Encrypting {total} blobs...")
+		
+		with self.dlfi.conn:
+			for i, file_hash in enumerate(blob_hashes, 1):
+				try:
+					# Read plaintext data
+					plaintext = self._read_blob_raw(file_hash)
+					if plaintext is None:
+						logger.warning(f"Blob not found: {file_hash[:8]}...")
+						continue
+					
+					# Encrypt
+					encrypted = new_crypto.encrypt(plaintext)
+					
+					# Write back (may need re-partitioning due to size change)
+					part_count = self._write_blob_raw(file_hash, encrypted, self.dlfi.partitioner)
+					self._update_blob_part_count(file_hash, part_count)
+					
+					if i % 100 == 0 or i == total:
+						logger.info(f"Encrypted {i}/{total} blobs")
+						
+				except Exception as e:
+					logger.error(f"Failed to encrypt blob {file_hash[:8]}: {e}")
+					raise
 		
 		# Update config
 		self.dlfi.config.encrypted = True
@@ -105,17 +190,51 @@ class VaultConfigManager:
 			logger.error("Vault is not encrypted")
 			return False
 		
-		# Verify password
+		if not current_password:
+			logger.error("Current password is required")
+			return False
+		
+		# Verify password by creating crypto instance
 		try:
 			old_crypto = VaultCrypto.from_salt_b64(current_password, self.dlfi.config.salt)
 		except Exception as e:
-			logger.error(f"Invalid password: {e}")
+			logger.error(f"Failed to initialize decryption: {e}")
 			return False
 		
 		logger.info("Disabling encryption on vault...")
 		
-		# Decrypt all blobs
-		self._reprocess_blobs(old_crypto=old_crypto, new_crypto=None)
+		# Process all blobs
+		blob_hashes = self._get_all_blob_hashes()
+		total = len(blob_hashes)
+		
+		logger.info(f"Decrypting {total} blobs...")
+		
+		with self.dlfi.conn:
+			for i, file_hash in enumerate(blob_hashes, 1):
+				try:
+					# Read encrypted data
+					encrypted = self._read_blob_raw(file_hash)
+					if encrypted is None:
+						logger.warning(f"Blob not found: {file_hash[:8]}...")
+						continue
+					
+					# Decrypt
+					try:
+						plaintext = old_crypto.decrypt(encrypted)
+					except Exception as e:
+						logger.error(f"Decryption failed for {file_hash[:8]}: {e}")
+						raise ValueError(f"Decryption failed - incorrect password or corrupted data")
+					
+					# Write back (may need re-partitioning due to size change)
+					part_count = self._write_blob_raw(file_hash, plaintext, self.dlfi.partitioner)
+					self._update_blob_part_count(file_hash, part_count)
+					
+					if i % 100 == 0 or i == total:
+						logger.info(f"Decrypted {i}/{total} blobs")
+						
+				except Exception as e:
+					logger.error(f"Failed to decrypt blob {file_hash[:8]}: {e}")
+					raise
 		
 		# Update config
 		self.dlfi.config.encrypted = False
@@ -129,29 +248,69 @@ class VaultConfigManager:
 		return True
 	
 	def change_password(self, old_password: str, new_password: str) -> bool:
-		"""Change encryption password, re-encrypting all blobs."""
+		"""
+		Change encryption password.
+		Re-encrypts all blobs with new key.
+		"""
 		from .crypto import VaultCrypto
 		
 		if not self.dlfi.config.encrypted:
-			logger.error("Vault is not encrypted")
+			logger.error("Vault is not encrypted - use enable_encryption() instead")
+			return False
+		
+		if not old_password or not new_password:
+			logger.error("Both old and new passwords are required")
 			return False
 		
 		# Verify old password
 		try:
 			old_crypto = VaultCrypto.from_salt_b64(old_password, self.dlfi.config.salt)
 		except Exception as e:
-			logger.error(f"Invalid current password: {e}")
+			logger.error(f"Failed to verify old password: {e}")
 			return False
+		
+		# Create new crypto with new password and NEW salt
+		new_crypto = VaultCrypto(password=new_password)
 		
 		logger.info("Changing vault password...")
 		
-		# Create new crypto with new password and new salt
-		new_crypto = VaultCrypto(password=new_password)
+		# Process all blobs
+		blob_hashes = self._get_all_blob_hashes()
+		total = len(blob_hashes)
 		
-		# Re-encrypt all blobs
-		self._reprocess_blobs(old_crypto=old_crypto, new_crypto=new_crypto)
+		logger.info(f"Re-encrypting {total} blobs with new password...")
 		
-		# Update config
+		with self.dlfi.conn:
+			for i, file_hash in enumerate(blob_hashes, 1):
+				try:
+					# Read encrypted data
+					encrypted_old = self._read_blob_raw(file_hash)
+					if encrypted_old is None:
+						logger.warning(f"Blob not found: {file_hash[:8]}...")
+						continue
+					
+					# Decrypt with old key
+					try:
+						plaintext = old_crypto.decrypt(encrypted_old)
+					except Exception as e:
+						logger.error(f"Decryption failed for {file_hash[:8]}: {e}")
+						raise ValueError(f"Decryption failed - incorrect password or corrupted data")
+					
+					# Encrypt with new key
+					encrypted_new = new_crypto.encrypt(plaintext)
+					
+					# Write back (may need re-partitioning due to size change from new nonce)
+					part_count = self._write_blob_raw(file_hash, encrypted_new, self.dlfi.partitioner)
+					self._update_blob_part_count(file_hash, part_count)
+					
+					if i % 100 == 0 or i == total:
+						logger.info(f"Re-encrypted {i}/{total} blobs")
+						
+				except Exception as e:
+					logger.error(f"Failed to re-encrypt blob {file_hash[:8]}: {e}")
+					raise
+		
+		# Update config with new salt
 		self.dlfi.config.salt = new_crypto.get_salt_b64()
 		self.dlfi.config.save(self.dlfi.config_path)
 		
@@ -162,16 +321,56 @@ class VaultConfigManager:
 		return True
 	
 	def change_partition_size(self, new_size: int) -> bool:
-		"""Change partition size and re-partition all blobs."""
+		"""
+		Change partition size and re-partition all blobs accordingly.
+		
+		:param new_size: New chunk size in bytes. 0 to disable partitioning.
+		"""
 		from .partition import FilePartitioner
 		
-		logger.info(f"Changing partition size to {new_size} bytes...")
+		if new_size < 0:
+			logger.error("Partition size cannot be negative")
+			return False
 		
-		old_partitioner = self.dlfi.partitioner
+		if new_size > 0 and new_size < FilePartitioner.MIN_CHUNK_SIZE:
+			logger.error(f"Partition size must be at least {FilePartitioner.MIN_CHUNK_SIZE} bytes")
+			return False
+		
+		old_size = self.dlfi.config.partition_size
+		if old_size == new_size:
+			logger.info("Partition size unchanged")
+			return True
+		
+		logger.info(f"Changing partition size from {old_size} to {new_size} bytes...")
+		
+		# Create new partitioner
 		new_partitioner = FilePartitioner(chunk_size=new_size)
 		
-		# Re-partition all blobs
-		self._repartition_blobs(old_partitioner, new_partitioner)
+		# Process all blobs
+		blob_hashes = self._get_all_blob_hashes()
+		total = len(blob_hashes)
+		
+		logger.info(f"Re-partitioning {total} blobs...")
+		
+		with self.dlfi.conn:
+			for i, file_hash in enumerate(blob_hashes, 1):
+				try:
+					# Read current data (encrypted or plaintext, doesn't matter)
+					data = self._read_blob_raw(file_hash)
+					if data is None:
+						logger.warning(f"Blob not found: {file_hash[:8]}...")
+						continue
+					
+					# Write back with new partitioning
+					part_count = self._write_blob_raw(file_hash, data, new_partitioner)
+					self._update_blob_part_count(file_hash, part_count)
+					
+					if i % 100 == 0 or i == total:
+						logger.info(f"Re-partitioned {i}/{total} blobs")
+						
+				except Exception as e:
+					logger.error(f"Failed to re-partition blob {file_hash[:8]}: {e}")
+					raise
 		
 		# Update config
 		self.dlfi.config.partition_size = new_size
@@ -183,105 +382,44 @@ class VaultConfigManager:
 		logger.info("Partition size changed successfully")
 		return True
 	
-	def _reprocess_blobs(self, old_crypto, new_crypto):
-		"""Re-encrypt or decrypt all blobs."""
-		from .partition import FilePartitioner
+	def reconfigure(self, 
+					password: str = None,
+					new_password: str = None,
+					enable_encryption: bool = None,
+					partition_size: int = None) -> bool:
+		"""
+		Convenience method to change multiple settings at once.
+		Handles the correct order of operations.
 		
-		cursor = self.dlfi.conn.execute("SELECT hash, storage_path, size_bytes FROM blobs")
-		blobs = cursor.fetchall()
+		:param password: Current password (required if vault is encrypted)
+		:param new_password: New password (if changing password or enabling encryption)
+		:param enable_encryption: True to enable, False to disable, None to keep current
+		:param partition_size: New partition size, or None to keep current
+		"""
+		success = True
 		
-		for file_hash, rel_path, size_bytes in blobs:
-			try:
-				self._reprocess_single_blob(file_hash, old_crypto, new_crypto)
-			except Exception as e:
-				logger.error(f"Failed to reprocess blob {file_hash[:8]}: {e}")
-				raise
-	
-	def _reprocess_single_blob(self, file_hash: str, old_crypto, new_crypto):
-		"""Re-encrypt/decrypt a single blob (handles partitions)."""
-		from .partition import FilePartitioner
+		# Handle encryption changes first
+		if enable_encryption is True and not self.dlfi.config.encrypted:
+			pwd = new_password or password
+			if not pwd:
+				logger.error("Password required to enable encryption")
+				return False
+			success = self.enable_encryption(pwd) and success
+			
+		elif enable_encryption is False and self.dlfi.config.encrypted:
+			if not password:
+				logger.error("Current password required to disable encryption")
+				return False
+			success = self.disable_encryption(password) and success
+			
+		elif new_password and self.dlfi.config.encrypted:
+			if not password:
+				logger.error("Current password required to change password")
+				return False
+			success = self.change_password(password, new_password) and success
 		
-		part_files = FilePartitioner.get_part_files(self.dlfi.storage_dir, file_hash)
-		if not part_files:
-			logger.warning(f"Blob files not found for {file_hash[:8]}")
-			return
+		# Then handle partition size
+		if partition_size is not None and partition_size != self.dlfi.config.partition_size:
+			success = self.change_partition_size(partition_size) and success
 		
-		# Read and decrypt
-		data = bytearray()
-		for part in sorted(part_files, key=lambda p: p.name):
-			with open(part, 'rb') as f:
-				part_data = f.read()
-			if old_crypto and old_crypto.enabled:
-				part_data = old_crypto.decrypt(part_data)
-			data.extend(part_data)
-		
-		# Encrypt with new key
-		if new_crypto and new_crypto.enabled:
-			data = new_crypto.encrypt(bytes(data))
-		
-		# Write back (re-partition if needed)
-		shard_a = file_hash[:2]
-		shard_b = file_hash[2:4]
-		blob_dir = self.dlfi.storage_dir / shard_a / shard_b
-		
-		# Remove old parts
-		for part in part_files:
-			part.unlink()
-		
-		# Write new data
-		if self.dlfi.partitioner.needs_partitioning(len(data)):
-			parts = self.dlfi.partitioner.split_bytes(bytes(data))
-			for i, part_data in enumerate(parts, 1):
-				part_path = blob_dir / f"{file_hash}.{i:03d}"
-				with open(part_path, 'wb') as f:
-					f.write(part_data)
-		else:
-			with open(blob_dir / file_hash, 'wb') as f:
-				f.write(data)
-	
-	def _repartition_blobs(self, old_partitioner, new_partitioner):
-		"""Re-partition all blobs with new chunk size."""
-		cursor = self.dlfi.conn.execute("SELECT hash, size_bytes FROM blobs")
-		blobs = cursor.fetchall()
-		
-		for file_hash, size_bytes in blobs:
-			try:
-				self._repartition_single_blob(file_hash, old_partitioner, new_partitioner)
-			except Exception as e:
-				logger.error(f"Failed to repartition blob {file_hash[:8]}: {e}")
-				raise
-	
-	def _repartition_single_blob(self, file_hash: str, old_partitioner, new_partitioner):
-		"""Re-partition a single blob."""
-		from .partition import FilePartitioner
-		
-		part_files = FilePartitioner.get_part_files(self.dlfi.storage_dir, file_hash)
-		if not part_files:
-			logger.warning(f"Blob files not found for {file_hash[:8]}")
-			return
-		
-		# Read all parts
-		data = bytearray()
-		for part in sorted(part_files, key=lambda p: p.name):
-			with open(part, 'rb') as f:
-				data.extend(f.read())
-		
-		# Get blob directory
-		shard_a = file_hash[:2]
-		shard_b = file_hash[2:4]
-		blob_dir = self.dlfi.storage_dir / shard_a / shard_b
-		
-		# Remove old parts
-		for part in part_files:
-			part.unlink()
-		
-		# Write with new partitioning
-		if new_partitioner.needs_partitioning(len(data)):
-			parts = new_partitioner.split_bytes(bytes(data))
-			for i, part_data in enumerate(parts, 1):
-				part_path = blob_dir / f"{file_hash}.{i:03d}"
-				with open(part_path, 'wb') as f:
-					f.write(part_data)
-		else:
-			with open(blob_dir / file_hash, 'wb') as f:
-				f.write(data)
+		return success
