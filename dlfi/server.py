@@ -24,6 +24,8 @@ class DLFIServer:
 		self.archive_path = None
 		self._server = None
 		self._extraction_logs = []
+		self._meta_keys_cache = None
+		self._relations_cache = None
 	
 	def start(self, blocking: bool = True):
 		handler = self._create_handler()
@@ -52,6 +54,8 @@ class DLFIServer:
 			self.dlfi.close()
 		self.archive_path = Path(path).resolve()
 		self.dlfi = DLFI(str(self.archive_path), password=password)
+		self._meta_keys_cache = None
+		self._relations_cache = None
 		logger.info(f"Opened archive: {self.archive_path}")
 	
 	def close_archive(self):
@@ -59,11 +63,19 @@ class DLFIServer:
 			self.dlfi.close()
 			self.dlfi = None
 			self.archive_path = None
+			self._meta_keys_cache = None
+			self._relations_cache = None
+	
+	def _invalidate_caches(self):
+		self._meta_keys_cache = None
+		self._relations_cache = None
 	
 	def _get_all_metadata_keys(self) -> List[str]:
-		"""Extract all unique metadata keys from the archive."""
 		if not self.dlfi:
 			return []
+		if self._meta_keys_cache is not None:
+			return self._meta_keys_cache
+		
 		cursor = self.dlfi.conn.execute(
 			"SELECT DISTINCT metadata FROM nodes WHERE metadata IS NOT NULL"
 		)
@@ -74,10 +86,10 @@ class DLFIServer:
 				self._collect_keys(meta, "", keys)
 			except:
 				pass
-		return sorted(keys)
+		self._meta_keys_cache = sorted(keys)
+		return self._meta_keys_cache
 	
 	def _collect_keys(self, obj: dict, prefix: str, keys: set):
-		"""Recursively collect all keys from nested dict."""
 		for k, v in obj.items():
 			full_key = f"{prefix}.{k}" if prefix else k
 			keys.add(full_key)
@@ -85,7 +97,6 @@ class DLFIServer:
 				self._collect_keys(v, full_key, keys)
 	
 	def _get_metadata_values(self, key: str) -> List[str]:
-		"""Get all unique values for a metadata key."""
 		if not self.dlfi:
 			return []
 		cursor = self.dlfi.conn.execute(
@@ -108,6 +119,22 @@ class DLFIServer:
 			except:
 				pass
 		return sorted(values)[:50]
+	
+	def _get_all_relations(self) -> List[str]:
+		if not self.dlfi:
+			return []
+		if self._relations_cache is not None:
+			return self._relations_cache
+		
+		cursor = self.dlfi.conn.execute("SELECT DISTINCT relation FROM edges ORDER BY relation")
+		self._relations_cache = [r[0] for r in cursor]
+		return self._relations_cache
+	
+	def _get_all_tags(self) -> List[str]:
+		if not self.dlfi:
+			return []
+		cursor = self.dlfi.conn.execute("SELECT DISTINCT tag FROM tags ORDER BY tag")
+		return [r[0] for r in cursor]
 	
 	def _create_handler(self):
 		server = self
@@ -186,7 +213,7 @@ class DLFIServer:
 			
 			def require_archive(self):
 				if not server.dlfi:
-					self.send_error_json("No archive open. Open an archive first.", 400)
+					self.send_error_json("No archive open.", 400)
 					return False
 				return True
 			
@@ -284,26 +311,41 @@ class DLFIServer:
 			# === Smart Autocomplete ===
 			
 			def api_smart_autocomplete(self, context: str, query: str):
-				"""
-				Context-aware autocomplete.
-				context can be:
-				- "start" - beginning of token, suggest prefixes and keys
-				- "tag:" or "tag=" - suggest tag values
-				- "meta:KEY:" or "meta:KEY=" - suggest values for KEY
-				- "key" - suggest metadata keys
-				"""
 				if not self.require_archive():
 					return
 				
 				try:
 					suggestions = []
+					q_lower = query.lower()
 					
 					if context == "start" or context == "key":
-						# Suggest metadata keys and special prefixes
+						# Suggest metadata keys, tag:, relations, and !
 						meta_keys = server._get_all_metadata_keys()
-						q_lower = query.lower()
+						relations = server._get_all_relations()
 						
-						# Filter and format suggestions
+						# Special prefixes
+						prefixes = [
+							{"value": "tag:", "label": "tag:", "type": "prefix", "hint": "filter by tag"},
+							{"value": "!", "label": "!", "type": "prefix", "hint": "relationship query"},
+							{"value": "^", "label": "^", "type": "prefix", "hint": "deep search (children inherit)"},
+							{"value": "%", "label": "%", "type": "prefix", "hint": "reverse deep search (parents inherit)"},
+						]
+						
+						for p in prefixes:
+							if not query or p["value"].startswith(q_lower):
+								suggestions.append(p)
+						
+						# Relations as direct search
+						for rel in relations:
+							if not query or q_lower in rel.lower():
+								suggestions.append({
+									"value": rel,
+									"label": rel,
+									"type": "relation",
+									"hint": "has relationship type"
+								})
+						
+						# Metadata keys
 						for key in meta_keys:
 							if not query or q_lower in key.lower():
 								suggestions.append({
@@ -313,27 +355,12 @@ class DLFIServer:
 									"hint": "metadata key"
 								})
 						
-						# Also suggest tag: prefix if relevant
-						if not query or "tag".startswith(q_lower):
-							suggestions.insert(0, {
-								"value": "tag:",
-								"label": "tag:",
-								"type": "prefix",
-								"hint": "filter by tag"
-							})
-						
-						# Limit
-						suggestions = suggestions[:20]
+						suggestions = suggestions[:25]
 					
 					elif context.startswith("tag"):
 						# Suggest tags
-						cursor = server.dlfi.conn.execute(
-							"SELECT DISTINCT tag FROM tags ORDER BY tag"
-						)
-						all_tags = [r[0] for r in cursor]
-						q_lower = query.lower()
-						
-						for tag in all_tags:
+						tags = server._get_all_tags()
+						for tag in tags:
 							if not query or q_lower in tag.lower():
 								suggestions.append({
 									"value": tag,
@@ -344,14 +371,12 @@ class DLFIServer:
 						suggestions = suggestions[:20]
 					
 					elif context.startswith("meta:"):
-						# Suggest values for a specific metadata key
+						# Suggest values for metadata key
 						key = context[5:]
 						if key.endswith(":") or key.endswith("="):
 							key = key[:-1]
 						
 						values = server._get_metadata_values(key)
-						q_lower = query.lower()
-						
 						for val in values:
 							if not query or q_lower in val.lower():
 								suggestions.append({
@@ -362,26 +387,24 @@ class DLFIServer:
 								})
 						suggestions = suggestions[:20]
 					
-					elif context == "relation":
-						cursor = server.dlfi.conn.execute(
-							"SELECT DISTINCT relation FROM edges ORDER BY relation"
-						)
-						q_lower = query.lower()
-						for r in cursor:
-							if not query or q_lower in r[0].lower():
+					elif context == "relation" or context == "rel":
+						# Suggest relation names
+						relations = server._get_all_relations()
+						for rel in relations:
+							if not query or q_lower in rel.lower():
 								suggestions.append({
-									"value": r[0],
-									"label": r[0],
+									"value": rel,
+									"label": rel,
 									"type": "relation",
-									"hint": "relationship"
+									"hint": "relationship type"
 								})
 						suggestions = suggestions[:20]
 					
-					elif context == "path":
+					elif context == "path" or context == "!":
+						# Suggest node paths
 						cursor = server.dlfi.conn.execute(
 							"SELECT cached_path FROM nodes ORDER BY cached_path LIMIT 100"
 						)
-						q_lower = query.lower()
 						for r in cursor:
 							if not query or q_lower in r[0].lower():
 								suggestions.append({
@@ -389,6 +412,19 @@ class DLFIServer:
 									"label": r[0],
 									"type": "path",
 									"hint": "node path"
+								})
+						suggestions = suggestions[:20]
+					
+					elif context == "!:":
+						# After !path:, suggest relations
+						relations = server._get_all_relations()
+						for rel in relations:
+							if not query or q_lower in rel.lower():
+								suggestions.append({
+									"value": rel,
+									"label": rel,
+									"type": "relation",
+									"hint": "relationship type"
 								})
 						suggestions = suggestions[:20]
 					
@@ -402,18 +438,20 @@ class DLFIServer:
 			def api_smart_search(self):
 				"""
 				Parse and execute smart search query.
+				
 				Syntax:
 				- tag:value - tag contains value
 				- tag=value - tag equals value
-				- key:value - metadata key contains value
-				- key=value - metadata key equals value
-				- key - metadata key exists
-				- plain text - full text search
-				
-				Additional filters passed separately:
-				- type: VAULT/RECORD
-				- inside: path prefix
-				- related_to: {target, relation}
+				- key:value - metadata contains
+				- key=value - metadata equals
+				- key - metadata exists
+				- RELATION - has this relationship type
+				- !path - related to path (any direction)
+				- !path:RELATION - related to path with relation
+				- !path:RELATION> - outgoing to path
+				- !path:RELATION< - incoming from path
+				- ^... - deep search (children inherit)
+				- %... - reverse deep search (parents inherit)
 				"""
 				if not self.require_archive():
 					return
@@ -424,37 +462,91 @@ class DLFIServer:
 					filters = body.get("filters", {})
 					limit = body.get("limit", 200)
 					
-					# Parse query string
 					parsed = self._parse_smart_query(query_str)
 					
 					# Build SQL
-					sql_parts = ["SELECT DISTINCT n.uuid, n.cached_path, n.type, n.name, n.metadata FROM nodes n"]
+					base_select = """
+						SELECT DISTINCT n.uuid, n.cached_path, n.type, n.name, n.metadata,
+						(SELECT nf.file_hash FROM node_files nf 
+						JOIN blobs b ON nf.file_hash = b.hash 
+						WHERE nf.node_uuid = n.uuid AND b.ext IN ('jpg','jpeg','png','gif','webp','bmp','mp4','webm','mov')
+						ORDER BY nf.display_order LIMIT 1) as preview_hash,
+						(SELECT b.ext FROM node_files nf 
+						JOIN blobs b ON nf.file_hash = b.hash 
+						WHERE nf.node_uuid = n.uuid AND b.ext IN ('jpg','jpeg','png','gif','webp','bmp','mp4','webm','mov')
+						ORDER BY nf.display_order LIMIT 1) as preview_ext
+						FROM nodes n
+					"""
+					
 					joins = []
 					conditions = []
 					params = []
 					
-					# Tag conditions
-					if parsed["tags_contain"] or parsed["tags_eq"]:
-						joins.append("LEFT JOIN tags t ON n.uuid = t.node_uuid")
+					# Tag conditions (regular)
+					for tag_cond in parsed["tags_contain"]:
+						if tag_cond["deep"]:
+							# Deep: children inherit parent tags
+							conditions.append("""
+								EXISTS (
+									SELECT 1 FROM nodes ancestor
+									JOIN tags at ON ancestor.uuid = at.node_uuid
+									WHERE (n.cached_path = ancestor.cached_path OR n.cached_path LIKE ancestor.cached_path || '/%')
+									AND at.tag LIKE ?
+								)
+							""")
+							params.append(f"%{tag_cond['value'].lower()}%")
+						elif tag_cond["reverse_deep"]:
+							# Reverse deep: parents inherit children tags
+							conditions.append("""
+								EXISTS (
+									SELECT 1 FROM nodes descendant
+									JOIN tags dt ON descendant.uuid = dt.node_uuid
+									WHERE (descendant.cached_path = n.cached_path OR descendant.cached_path LIKE n.cached_path || '/%')
+									AND dt.tag LIKE ?
+								)
+							""")
+							params.append(f"%{tag_cond['value'].lower()}%")
+						else:
+							if "tags t" not in " ".join(joins):
+								joins.append("LEFT JOIN tags t ON n.uuid = t.node_uuid")
+							conditions.append("t.tag LIKE ?")
+							params.append(f"%{tag_cond['value'].lower()}%")
 					
-					for tag in parsed["tags_contain"]:
-						conditions.append("t.tag LIKE ?")
-						params.append(f"%{tag.lower()}%")
+					for tag_cond in parsed["tags_eq"]:
+						if tag_cond["deep"]:
+							conditions.append("""
+								EXISTS (
+									SELECT 1 FROM nodes ancestor
+									JOIN tags at ON ancestor.uuid = at.node_uuid
+									WHERE (n.cached_path = ancestor.cached_path OR n.cached_path LIKE ancestor.cached_path || '/%')
+									AND at.tag = ?
+								)
+							""")
+							params.append(tag_cond['value'].lower())
+						elif tag_cond["reverse_deep"]:
+							conditions.append("""
+								EXISTS (
+									SELECT 1 FROM nodes descendant
+									JOIN tags dt ON descendant.uuid = dt.node_uuid
+									WHERE (descendant.cached_path = n.cached_path OR descendant.cached_path LIKE n.cached_path || '/%')
+									AND dt.tag = ?
+								)
+							""")
+							params.append(tag_cond['value'].lower())
+						else:
+							if "tags t" not in " ".join(joins):
+								joins.append("LEFT JOIN tags t ON n.uuid = t.node_uuid")
+							conditions.append("t.tag = ?")
+							params.append(tag_cond['value'].lower())
 					
-					for tag in parsed["tags_eq"]:
-						conditions.append("t.tag = ?")
-						params.append(tag.lower())
-					
-					# Metadata contains
+					# Metadata conditions
 					for key, value in parsed["meta_contain"].items():
-						json_path = self._key_to_json_path(key)
+						json_path = key
 						conditions.append(f"LOWER(json_extract(n.metadata, '$.{json_path}')) LIKE ?")
 						params.append(f"%{value.lower()}%")
 					
-					# Metadata equals
 					for key, value in parsed["meta_eq"].items():
-						json_path = self._key_to_json_path(key)
-						# Try numeric comparison if value looks like a number
+						json_path = key
 						try:
 							num_val = float(value)
 							conditions.append(f"json_extract(n.metadata, '$.{json_path}') = ?")
@@ -463,15 +555,132 @@ class DLFIServer:
 							conditions.append(f"json_extract(n.metadata, '$.{json_path}') = ?")
 							params.append(value)
 					
-					# Metadata exists
 					for key in parsed["meta_exists"]:
-						json_path = self._key_to_json_path(key)
+						json_path = key
 						conditions.append(f"json_extract(n.metadata, '$.{json_path}') IS NOT NULL")
+					
+					# Relationship type conditions
+					for rel_cond in parsed["has_relation"]:
+						if rel_cond["deep"]:
+							conditions.append("""
+								EXISTS (
+									SELECT 1 FROM nodes ancestor
+									JOIN edges ae ON (ancestor.uuid = ae.source_uuid OR ancestor.uuid = ae.target_uuid)
+									WHERE (n.cached_path = ancestor.cached_path OR n.cached_path LIKE ancestor.cached_path || '/%')
+									AND ae.relation = ?
+								)
+							""")
+							params.append(rel_cond['value'].upper())
+						elif rel_cond["reverse_deep"]:
+							conditions.append("""
+								EXISTS (
+									SELECT 1 FROM nodes descendant
+									JOIN edges de ON (descendant.uuid = de.source_uuid OR descendant.uuid = de.target_uuid)
+									WHERE (descendant.cached_path = n.cached_path OR descendant.cached_path LIKE n.cached_path || '/%')
+									AND de.relation = ?
+								)
+							""")
+							params.append(rel_cond['value'].upper())
+						else:
+							joins.append("JOIN edges er ON (n.uuid = er.source_uuid OR n.uuid = er.target_uuid)")
+							conditions.append("er.relation = ?")
+							params.append(rel_cond['value'].upper())
+					
+					# Related to path conditions
+					for rel in parsed["related_to"]:
+						target_path = rel["path"]
+						relation = rel["relation"]
+						direction = rel["direction"]  # None, '>', '<'
+						deep = rel["deep"]
+						reverse_deep = rel["reverse_deep"]
+						
+						# Resolve target UUID
+						target_uuid = server.dlfi._resolve_path(target_path)
+						if not target_uuid:
+							conditions.append("1=0")  # No results
+							continue
+						
+						if deep:
+							# Children inherit: find nodes whose ancestors are related to target
+							subquery = """
+								EXISTS (
+									SELECT 1 FROM nodes ancestor
+									JOIN edges ae ON 
+							"""
+							if direction == '>':
+								subquery += "ancestor.uuid = ae.source_uuid AND ae.target_uuid = ?"
+							elif direction == '<':
+								subquery += "ancestor.uuid = ae.target_uuid AND ae.source_uuid = ?"
+							else:
+								subquery += "(ancestor.uuid = ae.source_uuid AND ae.target_uuid = ?) OR (ancestor.uuid = ae.target_uuid AND ae.source_uuid = ?)"
+							
+							subquery += """
+									WHERE (n.cached_path = ancestor.cached_path OR n.cached_path LIKE ancestor.cached_path || '/%')
+							"""
+							
+							if direction is None:
+								params.extend([target_uuid, target_uuid])
+							else:
+								params.append(target_uuid)
+							
+							if relation:
+								subquery += " AND ae.relation = ?"
+								params.append(relation.upper())
+							
+							subquery += ")"
+							conditions.append(subquery)
+						
+						elif reverse_deep:
+							# Parents inherit: find nodes whose descendants are related to target
+							subquery = """
+								EXISTS (
+									SELECT 1 FROM nodes descendant
+									JOIN edges de ON 
+							"""
+							if direction == '>':
+								subquery += "descendant.uuid = de.source_uuid AND de.target_uuid = ?"
+							elif direction == '<':
+								subquery += "descendant.uuid = de.target_uuid AND de.source_uuid = ?"
+							else:
+								subquery += "(descendant.uuid = de.source_uuid AND de.target_uuid = ?) OR (descendant.uuid = de.target_uuid AND de.source_uuid = ?)"
+							
+							subquery += """
+									WHERE (descendant.cached_path = n.cached_path OR descendant.cached_path LIKE n.cached_path || '/%')
+							"""
+							
+							if direction is None:
+								params.extend([target_uuid, target_uuid])
+							else:
+								params.append(target_uuid)
+							
+							if relation:
+								subquery += " AND de.relation = ?"
+								params.append(relation.upper())
+							
+							subquery += ")"
+							conditions.append(subquery)
+						
+						else:
+							# Direct relationship
+							alias = f"e_rel_{len(joins)}"
+							if direction == '>':
+								joins.append(f"JOIN edges {alias} ON n.uuid = {alias}.source_uuid AND {alias}.target_uuid = ?")
+								params.append(target_uuid)
+							elif direction == '<':
+								joins.append(f"JOIN edges {alias} ON n.uuid = {alias}.target_uuid AND {alias}.source_uuid = ?")
+								params.append(target_uuid)
+							else:
+								joins.append(f"JOIN edges {alias} ON (n.uuid = {alias}.source_uuid AND {alias}.target_uuid = ?) OR (n.uuid = {alias}.target_uuid AND {alias}.source_uuid = ?)")
+								params.extend([target_uuid, target_uuid])
+							
+							if relation:
+								conditions.append(f"{alias}.relation = ?")
+								params.append(relation.upper())
 					
 					# Full text search
 					if parsed["text"]:
 						text_query = " ".join(parsed["text"]).lower()
-						if "t" not in "".join(joins):
+						if "tags t" not in " ".join(joins):
 							joins.append("LEFT JOIN tags t ON n.uuid = t.node_uuid")
 						conditions.append("""(
 							LOWER(n.cached_path) LIKE ? OR
@@ -490,24 +699,8 @@ class DLFIServer:
 						conditions.append("n.cached_path LIKE ?")
 						params.append(f"{filters['inside'].strip('/')}/%")
 					
-					if filters.get("related_to"):
-						rel = filters["related_to"]
-						target_path = rel.get("target", "")
-						relation = rel.get("relation")
-						
-						target_uuid = server.dlfi._resolve_path(target_path)
-						if target_uuid:
-							joins.append("JOIN edges e ON n.uuid = e.source_uuid")
-							conditions.append("e.target_uuid = ?")
-							params.append(target_uuid)
-							if relation:
-								conditions.append("e.relation = ?")
-								params.append(relation.upper())
-						else:
-							conditions.append("1=0")  # No results if target not found
-					
 					# Build final SQL
-					sql = sql_parts[0]
+					sql = base_select
 					if joins:
 						sql += " " + " ".join(joins)
 					if conditions:
@@ -520,7 +713,6 @@ class DLFIServer:
 					
 					results = []
 					for row in cursor:
-						# Fetch tags for each result
 						tags_cursor = server.dlfi.conn.execute(
 							"SELECT tag FROM tags WHERE node_uuid = ?", (row[0],)
 						)
@@ -532,7 +724,9 @@ class DLFIServer:
 							"type": row[2],
 							"name": row[3],
 							"metadata": json.loads(row[4]) if row[4] else {},
-							"tags": tags
+							"tags": tags,
+							"preview_hash": row[5],
+							"preview_ext": row[6]
 						})
 					
 					self.send_json({"results": results, "count": len(results)})
@@ -545,11 +739,13 @@ class DLFIServer:
 				"""Parse the smart search query string."""
 				result = {
 					"text": [],
-					"tags_contain": [],
+					"tags_contain": [],  # [{"value": x, "deep": bool, "reverse_deep": bool}]
 					"tags_eq": [],
 					"meta_contain": {},
 					"meta_eq": {},
-					"meta_exists": []
+					"meta_exists": [],
+					"has_relation": [],  # [{"value": x, "deep": bool, "reverse_deep": bool}]
+					"related_to": []  # [{"path": x, "relation": y, "direction": '>'/'<'/None, "deep": bool, "reverse_deep": bool}]
 				}
 				
 				if not query:
@@ -573,45 +769,113 @@ class DLFIServer:
 				if current:
 					tokens.append(current)
 				
+				meta_keys = server._get_all_metadata_keys()
+				relations = server._get_all_relations()
+				
 				for token in tokens:
 					token = token.strip()
 					if not token:
 						continue
 					
-					# Check for tag: or tag=
-					if token.lower().startswith("tag:"):
-						result["tags_contain"].append(token[4:])
+					# Check for deep/reverse deep modifiers
+					deep = False
+					reverse_deep = False
+					
+					if token.startswith("^"):
+						deep = True
+						token = token[1:]
+					elif token.startswith("%"):
+						reverse_deep = True
+						token = token[1:]
+					
+					if not token:
+						continue
+					
+					# Relationship query: !path or !path:RELATION or !path:RELATION> or !path:RELATION<
+					if token.startswith("!"):
+						rel_query = token[1:]
+						direction = None
+						
+						if rel_query.endswith(">"):
+							direction = ">"
+							rel_query = rel_query[:-1]
+						elif rel_query.endswith("<"):
+							direction = "<"
+							rel_query = rel_query[:-1]
+						
+						if ":" in rel_query:
+							path, relation = rel_query.split(":", 1)
+						else:
+							path = rel_query
+							relation = None
+						
+						result["related_to"].append({
+							"path": path,
+							"relation": relation,
+							"direction": direction,
+							"deep": deep,
+							"reverse_deep": reverse_deep
+						})
+					
+					# Tag queries
+					elif token.lower().startswith("tag:"):
+						result["tags_contain"].append({
+							"value": token[4:],
+							"deep": deep,
+							"reverse_deep": reverse_deep
+						})
 					elif token.lower().startswith("tag="):
-						result["tags_eq"].append(token[4:])
+						result["tags_eq"].append({
+							"value": token[4:],
+							"deep": deep,
+							"reverse_deep": reverse_deep
+						})
+					
+					# Metadata with operator
 					elif ":" in token:
-						# metadata contains
 						key, value = token.split(":", 1)
 						if key and value:
 							result["meta_contain"][key] = value
 						elif key:
 							result["meta_exists"].append(key)
+					
 					elif "=" in token:
-						# metadata equals
 						key, value = token.split("=", 1)
 						if key and value:
 							result["meta_eq"][key] = value
 						elif key:
 							result["meta_exists"].append(key)
+					
 					else:
-						# Could be metadata exists check or plain text
-						# If it looks like a key path (has dots or matches known keys), treat as exists
-						meta_keys = server._get_all_metadata_keys()
-						if token in meta_keys or "." in token:
+						# Could be: relation name, metadata key, or plain text
+						token_upper = token.upper()
+						
+						if token_upper in relations:
+							result["has_relation"].append({
+								"value": token_upper,
+								"deep": deep,
+								"reverse_deep": reverse_deep
+							})
+						elif token in meta_keys or "." in token:
 							result["meta_exists"].append(token)
 						else:
-							result["text"].append(token)
-				
+							# Check if it's a known relation (case insensitive)
+							matched_rel = None
+							for rel in relations:
+								if rel.lower() == token.lower():
+									matched_rel = rel
+									break
+							
+							if matched_rel:
+								result["has_relation"].append({
+									"value": matched_rel,
+									"deep": deep,
+									"reverse_deep": reverse_deep
+								})
+							else:
+								result["text"].append(token)
+					
 				return result
-			
-			def _key_to_json_path(self, key: str) -> str:
-				"""Convert dotted key to JSON path."""
-				# key like "source.url" becomes "source.url" for json_extract
-				return key
 			
 			# === Archive Management ===
 			
@@ -732,16 +996,17 @@ class DLFIServer:
 					try:
 						job = Job(JobConfig(cookie_file))
 						job.db = server.dlfi
-						server._extraction_logs.append(f"[START] Extracting: {url}")
+						server._extraction_logs.append(f"[START] {url}")
 						job.run(url, extractor_config if extractor_config else None)
-						server._extraction_logs.append(f"[DONE] Completed: {url}")
-						self.send_json({"success": True, "message": f"Extraction completed for {url}"})
+						server._extraction_logs.append(f"[DONE] {url}")
+						server._invalidate_caches()
+						self.send_json({"success": True})
 					finally:
 						if cookie_file and os.path.exists(cookie_file):
 							os.remove(cookie_file)
 				
 				except Exception as e:
-					server._extraction_logs.append(f"[ERROR] {url}: {str(e)}")
+					server._extraction_logs.append(f"[ERROR] {str(e)}")
 					logger.error(f"Extraction failed: {e}", exc_info=True)
 					self.send_error_json(str(e), 500)
 			
@@ -751,12 +1016,10 @@ class DLFIServer:
 				if not self.require_archive():
 					return
 				try:
-					cursor = server.dlfi.conn.execute("""
-						SELECT uuid, parent_uuid, type, name, cached_path 
-						FROM nodes ORDER BY cached_path
-					""")
-					nodes = [{"uuid": r[0], "parent": r[1], "type": r[2], "name": r[3], "path": r[4]} 
-							for r in cursor]
+					cursor = server.dlfi.conn.execute(
+						"SELECT uuid, parent_uuid, type, name, cached_path FROM nodes ORDER BY cached_path"
+					)
+					nodes = [{"uuid": r[0], "parent": r[1], "type": r[2], "name": r[3], "path": r[4]} for r in cursor]
 					self.send_json({"nodes": nodes})
 				except Exception as e:
 					self.send_error_json(str(e), 500)
@@ -768,21 +1031,17 @@ class DLFIServer:
 					if parent_uuid in ("null", ""):
 						parent_uuid = None
 					
-					cursor = server.dlfi.conn.execute("""
-						SELECT uuid, type, name, cached_path 
-						FROM nodes WHERE parent_uuid IS ?
-						ORDER BY type DESC, name
-					""", (parent_uuid,))
+					cursor = server.dlfi.conn.execute(
+						"SELECT uuid, type, name, cached_path FROM nodes WHERE parent_uuid IS ? ORDER BY type DESC, name",
+						(parent_uuid,)
+					)
 					
 					children = []
 					for row in cursor:
 						count = server.dlfi.conn.execute(
 							"SELECT COUNT(*) FROM nodes WHERE parent_uuid = ?", (row[0],)
 						).fetchone()[0]
-						children.append({
-							"uuid": row[0], "type": row[1], "name": row[2],
-							"path": row[3], "hasChildren": count > 0
-						})
+						children.append({"uuid": row[0], "type": row[1], "name": row[2], "path": row[3], "hasChildren": count > 0})
 					
 					self.send_json({"children": children})
 				except Exception as e:
@@ -792,10 +1051,10 @@ class DLFIServer:
 				if not self.require_archive():
 					return
 				try:
-					cursor = server.dlfi.conn.execute("""
-						SELECT uuid, parent_uuid, type, name, cached_path, metadata, created_at, last_modified
-						FROM nodes WHERE cached_path = ?
-					""", (node_path,))
+					cursor = server.dlfi.conn.execute(
+						"SELECT uuid, parent_uuid, type, name, cached_path, metadata, created_at, last_modified FROM nodes WHERE cached_path = ?",
+						(node_path,)
+					)
 					
 					row = cursor.fetchone()
 					if not row:
@@ -814,29 +1073,26 @@ class DLFIServer:
 					
 					node["relationships"] = [
 						{"relation": r[0], "target_path": r[1], "target_uuid": r[2]}
-						for r in server.dlfi.conn.execute("""
-							SELECT e.relation, n.cached_path, e.target_uuid
-							FROM edges e LEFT JOIN nodes n ON e.target_uuid = n.uuid
-							WHERE e.source_uuid = ?
-						""", (row[0],))
+						for r in server.dlfi.conn.execute(
+							"SELECT e.relation, n.cached_path, e.target_uuid FROM edges e LEFT JOIN nodes n ON e.target_uuid = n.uuid WHERE e.source_uuid = ?",
+							(row[0],)
+						)
 					]
 					
 					node["incoming_relationships"] = [
 						{"relation": r[0], "source_path": r[1], "source_uuid": r[2]}
-						for r in server.dlfi.conn.execute("""
-							SELECT e.relation, n.cached_path, e.source_uuid
-							FROM edges e LEFT JOIN nodes n ON e.source_uuid = n.uuid
-							WHERE e.target_uuid = ?
-						""", (row[0],))
+						for r in server.dlfi.conn.execute(
+							"SELECT e.relation, n.cached_path, e.source_uuid FROM edges e LEFT JOIN nodes n ON e.source_uuid = n.uuid WHERE e.target_uuid = ?",
+							(row[0],)
+						)
 					]
 					
 					node["files"] = [
 						{"name": r[0], "hash": r[1], "size": r[2], "ext": r[3], "parts": r[4]}
-						for r in server.dlfi.conn.execute("""
-							SELECT nf.original_name, nf.file_hash, b.size_bytes, b.ext, b.part_count
-							FROM node_files nf JOIN blobs b ON nf.file_hash = b.hash
-							WHERE nf.node_uuid = ? ORDER BY nf.display_order
-						""", (row[0],))
+						for r in server.dlfi.conn.execute(
+							"SELECT nf.original_name, nf.file_hash, b.size_bytes, b.ext, b.part_count FROM node_files nf JOIN blobs b ON nf.file_hash = b.hash WHERE nf.node_uuid = ? ORDER BY nf.display_order",
+							(row[0],)
+						)
 					]
 					
 					node["children_count"] = server.dlfi.conn.execute(
@@ -856,9 +1112,7 @@ class DLFIServer:
 						self.send_error_json("Blob not found", 404)
 						return
 					
-					ext = server.dlfi.conn.execute(
-						"SELECT ext FROM blobs WHERE hash = ?", (blob_hash,)
-					).fetchone()
+					ext = server.dlfi.conn.execute("SELECT ext FROM blobs WHERE hash = ?", (blob_hash,)).fetchone()
 					ext = ext[0] if ext else "bin"
 					
 					mime = mimetypes.guess_type(f"file.{ext}")[0] or "application/octet-stream"
@@ -886,6 +1140,7 @@ class DLFIServer:
 						self.send_error_json("Path is required")
 						return
 					uuid = server.dlfi.create_vault(path, metadata=metadata if metadata else None)
+					server._invalidate_caches()
 					self.send_json({"uuid": uuid, "path": path})
 				except Exception as e:
 					self.send_error_json(str(e), 500)
@@ -901,6 +1156,7 @@ class DLFIServer:
 						self.send_error_json("Path is required")
 						return
 					uuid = server.dlfi.create_record(path, metadata=metadata if metadata else None)
+					server._invalidate_caches()
 					self.send_json({"uuid": uuid, "path": path})
 				except Exception as e:
 					self.send_error_json(str(e), 500)
@@ -911,11 +1167,11 @@ class DLFIServer:
 				try:
 					fields, files = self.parse_multipart()
 					if not fields or not files:
-						self.send_error_json("Multipart form with 'path' and file required")
+						self.send_error_json("Multipart form required")
 						return
 					record_path = fields.get("path", "").strip()
 					if not record_path:
-						self.send_error_json("Record path is required")
+						self.send_error_json("Path required")
 						return
 					uploaded = []
 					for f in files:
@@ -954,10 +1210,7 @@ class DLFIServer:
 					uuid = server.dlfi._resolve_path(path)
 					if uuid:
 						with server.dlfi.conn:
-							server.dlfi.conn.execute(
-								"DELETE FROM tags WHERE node_uuid = ? AND tag = ?", 
-								(uuid, tag.lower())
-							)
+							server.dlfi.conn.execute("DELETE FROM tags WHERE node_uuid = ? AND tag = ?", (uuid, tag.lower()))
 					self.send_json({"success": True})
 				except Exception as e:
 					self.send_error_json(str(e), 500)
@@ -974,6 +1227,7 @@ class DLFIServer:
 						self.send_error_json("Source, target, and relation required")
 						return
 					server.dlfi.link(source, target, relation)
+					server._invalidate_caches()
 					self.send_json({"success": True})
 				except Exception as e:
 					self.send_error_json(str(e), 500)
@@ -997,6 +1251,7 @@ class DLFIServer:
 								"DELETE FROM edges WHERE source_uuid = ? AND target_uuid = ? AND relation = ?",
 								(src_uuid, tgt_uuid, relation.upper())
 							)
+					server._invalidate_caches()
 					self.send_json({"success": True})
 				except Exception as e:
 					self.send_error_json(str(e), 500)
@@ -1009,15 +1264,13 @@ class DLFIServer:
 					path = body.get("path", "").strip()
 					metadata = body.get("metadata")
 					if not path:
-						self.send_error_json("Path is required")
+						self.send_error_json("Path required")
 						return
 					
-					cursor = server.dlfi.conn.execute(
-						"SELECT uuid FROM nodes WHERE cached_path = ?", (path,)
-					)
+					cursor = server.dlfi.conn.execute("SELECT uuid FROM nodes WHERE cached_path = ?", (path,))
 					row = cursor.fetchone()
 					if not row:
-						self.send_error_json("Node not found", 404)
+						self.send_error_json("Not found", 404)
 						return
 					
 					uuid = row[0]
@@ -1027,9 +1280,9 @@ class DLFIServer:
 								"UPDATE nodes SET metadata = ?, last_modified = ? WHERE uuid = ?",
 								(json.dumps(metadata) if metadata else None, time.time(), uuid)
 							)
+					server._invalidate_caches()
 					self.send_json({"success": True, "uuid": uuid})
 				except Exception as e:
-					logger.error(f"Update node error: {e}", exc_info=True)
 					self.send_error_json(str(e), 500)
 			
 			def api_delete_node(self, node_path: str):
@@ -1038,15 +1291,16 @@ class DLFIServer:
 				try:
 					uuid = server.dlfi._resolve_path(node_path)
 					if not uuid:
-						self.send_error_json("Node not found", 404)
+						self.send_error_json("Not found", 404)
 						return
 					with server.dlfi.conn:
 						server.dlfi.conn.execute("DELETE FROM nodes WHERE uuid = ?", (uuid,))
+					server._invalidate_caches()
 					self.send_json({"success": True})
 				except Exception as e:
 					self.send_error_json(str(e), 500)
 			
-			# === Legacy Query (for backward compat) ===
+			# === Legacy Query ===
 			
 			def api_query(self):
 				if not self.require_archive():
@@ -1085,7 +1339,6 @@ class DLFIServer:
 					results = qb.execute()
 					self.send_json({"results": results, "count": len(results)})
 				except Exception as e:
-					logger.error(f"Query error: {e}", exc_info=True)
 					self.send_error_json(str(e), 500)
 			
 			# === Config ===
@@ -1112,12 +1365,12 @@ class DLFIServer:
 						success = server.dlfi.config_manager.disable_encryption(password)
 						self.send_json({"success": success})
 					elif action == "change_password":
-						old_pass = body.get("old_password", "")
-						new_pass = body.get("new_password", "")
-						if not old_pass or not new_pass:
+						old = body.get("old_password", "")
+						new = body.get("new_password", "")
+						if not old or not new:
 							self.send_error_json("Both passwords required")
 							return
-						success = server.dlfi.config_manager.change_password(old_pass, new_pass)
+						success = server.dlfi.config_manager.change_password(old, new)
 						self.send_json({"success": success})
 					else:
 						self.send_error_json("Invalid action")
@@ -1187,16 +1440,16 @@ def get_app_html() -> str:
 		
 		.main { display: flex; flex: 1; overflow: hidden; }
 		
-		.sidebar { width: 240px; background: var(--bg-2); border-right: 1px solid var(--border); display: flex; flex-direction: column; flex-shrink: 0; }
+		.sidebar { width: 220px; background: var(--bg-2); border-right: 1px solid var(--border); display: flex; flex-direction: column; flex-shrink: 0; }
 		.sidebar-header { padding: 12px 16px; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-2); display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); }
 		.tree-container { flex: 1; overflow-y: auto; padding: 4px 0; }
-		.tree-item { display: flex; align-items: center; padding: 6px 12px; cursor: pointer; font-size: 0.82rem; color: var(--text-1); transition: background 0.1s; }
+		.tree-item { display: flex; align-items: center; padding: 5px 12px; cursor: pointer; font-size: 0.8rem; color: var(--text-1); }
 		.tree-item:hover { background: var(--bg-3); }
 		.tree-item.selected { background: var(--accent); color: white; }
-		.tree-toggle { width: 16px; height: 16px; font-size: 8px; display: flex; align-items: center; justify-content: center; color: var(--text-3); margin-right: 4px; transition: transform 0.1s; }
+		.tree-toggle { width: 14px; height: 14px; font-size: 8px; display: flex; align-items: center; justify-content: center; color: var(--text-3); margin-right: 4px; transition: transform 0.1s; }
 		.tree-toggle.expanded { transform: rotate(90deg); }
 		.tree-toggle.hidden { visibility: hidden; }
-		.tree-icon { margin-right: 8px; font-size: 13px; }
+		.tree-icon { margin-right: 6px; font-size: 12px; }
 		.tree-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 		.tree-children { display: none; }
 		.tree-children.expanded { display: block; }
@@ -1206,135 +1459,138 @@ def get_app_html() -> str:
 		.search-container { padding: 16px 24px; background: var(--bg-2); border-bottom: 1px solid var(--border); }
 		.search-row { display: flex; gap: 12px; align-items: stretch; }
 		.search-input-wrap { flex: 1; position: relative; }
-		.search-input { width: 100%; padding: 12px 16px; background: var(--bg-1); border: 1px solid var(--border); color: var(--text-0); font-size: 0.95rem; outline: none; }
+		.search-input { width: 100%; padding: 12px 16px; background: var(--bg-1); border: 1px solid var(--border); color: var(--text-0); font-size: 0.9rem; outline: none; }
 		.search-input:focus { border-color: var(--accent); }
 		.search-input::placeholder { color: var(--text-3); }
-		.search-hint { font-size: 0.7rem; color: var(--text-3); margin-top: 8px; }
-		.search-hint code { background: var(--bg-3); padding: 2px 6px; font-family: monospace; }
 		
-		.autocomplete-dropdown { position: absolute; top: 100%; left: 0; right: 0; background: var(--bg-3); border: 1px solid var(--border); border-top: none; max-height: 300px; overflow-y: auto; z-index: 100; display: none; }
+		.search-hints { font-size: 0.65rem; color: var(--text-3); margin-top: 10px; line-height: 1.8; }
+		.search-hints code { background: var(--bg-3); padding: 2px 5px; font-family: monospace; margin-right: 6px; }
+		.search-hints-row { margin-bottom: 2px; }
+		
+		.autocomplete-dropdown { position: absolute; top: 100%; left: 0; right: 0; background: var(--bg-3); border: 1px solid var(--border); border-top: none; max-height: 280px; overflow-y: auto; z-index: 100; display: none; }
 		.autocomplete-dropdown.show { display: block; }
-		.autocomplete-item { padding: 10px 14px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; }
+		.autocomplete-item { padding: 8px 12px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; font-size: 0.85rem; }
 		.autocomplete-item:hover, .autocomplete-item.selected { background: var(--bg-4); }
-		.autocomplete-item-label { font-size: 0.85rem; }
-		.autocomplete-item-hint { font-size: 0.7rem; color: var(--text-3); }
+		.autocomplete-item-hint { font-size: 0.65rem; color: var(--text-3); }
 		
-		.filter-bar { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; align-items: center; }
-		.filter-chip { display: flex; align-items: center; gap: 6px; padding: 4px 10px; background: var(--bg-3); border: 1px solid var(--border); font-size: 0.75rem; color: var(--text-1); }
+		.filter-bar { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; align-items: center; }
+		.filter-chip { display: flex; align-items: center; gap: 6px; padding: 4px 10px; background: var(--bg-3); border: 1px solid var(--border); font-size: 0.7rem; color: var(--text-1); }
 		.filter-chip .remove { cursor: pointer; opacity: 0.5; }
 		.filter-chip .remove:hover { opacity: 1; }
-		.filter-add { padding: 4px 10px; background: transparent; border: 1px dashed var(--border); font-size: 0.75rem; color: var(--text-2); cursor: pointer; }
+		.filter-add { padding: 4px 10px; background: transparent; border: 1px dashed var(--border); font-size: 0.7rem; color: var(--text-2); cursor: pointer; }
 		.filter-add:hover { border-color: var(--text-2); color: var(--text-1); }
 		
 		.results-container { flex: 1; overflow-y: auto; padding: 16px 24px; }
-		.results-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; font-size: 0.8rem; color: var(--text-2); }
-		.results-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
+		.results-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; font-size: 0.75rem; color: var(--text-2); }
+		.results-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
 		
-		.result-card { background: var(--bg-2); border: 1px solid var(--border); padding: 14px; cursor: pointer; transition: border-color 0.1s; }
+		.result-card { background: var(--bg-2); border: 1px solid var(--border); cursor: pointer; transition: border-color 0.1s; display: flex; overflow: hidden; }
 		.result-card:hover { border-color: var(--accent); }
-		.result-header { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 8px; }
-		.result-icon { font-size: 1.2rem; }
-		.result-info { flex: 1; min-width: 0; }
-		.result-name { font-weight: 500; font-size: 0.9rem; margin-bottom: 2px; word-break: break-word; }
-		.result-path { font-size: 0.75rem; color: var(--text-2); word-break: break-all; }
-		.result-type { font-size: 0.6rem; text-transform: uppercase; padding: 2px 6px; background: var(--bg-3); color: var(--text-2); }
-		.result-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
-		.result-tag { font-size: 0.7rem; padding: 2px 8px; background: var(--bg-4); color: var(--text-2); }
+		.result-preview { width: 80px; height: 80px; flex-shrink: 0; background: var(--bg-3); display: flex; align-items: center; justify-content: center; overflow: hidden; }
+		.result-preview img, .result-preview video { width: 100%; height: 100%; object-fit: cover; }
+		.result-preview-icon { font-size: 1.5rem; color: var(--text-3); }
+		.result-body { flex: 1; padding: 10px 12px; min-width: 0; display: flex; flex-direction: column; }
+		.result-header { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 4px; }
+		.result-name { font-weight: 500; font-size: 0.85rem; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+		.result-type { font-size: 0.55rem; text-transform: uppercase; padding: 2px 5px; background: var(--bg-3); color: var(--text-2); flex-shrink: 0; }
+		.result-path { font-size: 0.7rem; color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-bottom: 6px; }
+		.result-meta { display: flex; flex-wrap: wrap; gap: 4px; }
+		.result-tag { font-size: 0.6rem; padding: 1px 6px; background: var(--bg-4); color: var(--text-2); }
 		.result-tag.is-tag { background: var(--accent-dim); color: var(--accent); }
 		
-		.detail-panel { width: 400px; background: var(--bg-2); border-left: 1px solid var(--border); display: flex; flex-direction: column; flex-shrink: 0; overflow: hidden; }
+		.detail-panel { width: 380px; background: var(--bg-2); border-left: 1px solid var(--border); display: flex; flex-direction: column; flex-shrink: 0; overflow: hidden; }
 		.detail-panel.hidden { display: none; }
-		.detail-header { padding: 16px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: flex-start; }
-		.detail-title { font-size: 1rem; font-weight: 600; word-break: break-word; }
-		.detail-close { background: none; border: none; color: var(--text-2); font-size: 1.2rem; cursor: pointer; }
-		.detail-body { flex: 1; overflow-y: auto; padding: 16px; }
-		.detail-section { margin-bottom: 24px; }
-		.detail-section-title { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-2); margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; }
+		.detail-header { padding: 14px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: flex-start; }
+		.detail-title { font-size: 0.95rem; font-weight: 600; word-break: break-word; }
+		.detail-close { background: none; border: none; color: var(--text-2); font-size: 1.1rem; cursor: pointer; }
+		.detail-body { flex: 1; overflow-y: auto; padding: 14px; }
+		.detail-section { margin-bottom: 20px; }
+		.detail-section-title { font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-2); margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }
 		
-		.detail-meta-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-		.detail-meta-item { background: var(--bg-3); padding: 10px; }
+		.detail-meta-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+		.detail-meta-item { background: var(--bg-3); padding: 8px; }
 		.detail-meta-item.full { grid-column: span 2; }
-		.detail-meta-label { font-size: 0.65rem; color: var(--text-2); margin-bottom: 4px; text-transform: uppercase; }
-		.detail-meta-value { font-size: 0.85rem; word-break: break-word; }
+		.detail-meta-label { font-size: 0.6rem; color: var(--text-2); margin-bottom: 3px; text-transform: uppercase; }
+		.detail-meta-value { font-size: 0.8rem; word-break: break-word; }
 		
-		.detail-tags { display: flex; flex-wrap: wrap; gap: 6px; }
-		.detail-tag { display: flex; align-items: center; gap: 4px; padding: 4px 10px; background: var(--bg-3); font-size: 0.75rem; color: var(--text-1); }
-		.detail-tag .remove { cursor: pointer; opacity: 0.5; font-size: 0.9rem; }
+		.detail-tags { display: flex; flex-wrap: wrap; gap: 5px; }
+		.detail-tag { display: flex; align-items: center; gap: 4px; padding: 3px 8px; background: var(--bg-3); font-size: 0.7rem; color: var(--text-1); }
+		.detail-tag .remove { cursor: pointer; opacity: 0.5; font-size: 0.8rem; }
 		.detail-tag .remove:hover { opacity: 1; }
 		
-		.detail-rel-item { display: flex; align-items: center; gap: 10px; padding: 10px; background: var(--bg-3); margin-bottom: 6px; cursor: pointer; }
+		.detail-rel-item { display: flex; align-items: center; gap: 8px; padding: 8px; background: var(--bg-3); margin-bottom: 5px; cursor: pointer; font-size: 0.75rem; }
 		.detail-rel-item:hover { background: var(--bg-4); }
-		.detail-rel-type { font-size: 0.65rem; text-transform: uppercase; color: var(--accent); font-weight: 600; min-width: 80px; }
-		.detail-rel-path { font-size: 0.8rem; color: var(--text-1); flex: 1; word-break: break-all; }
-		.detail-rel-dir { font-size: 0.6rem; color: var(--text-3); }
-		.detail-rel-remove { cursor: pointer; color: var(--text-3); font-size: 0.8rem; }
+		.detail-rel-type { font-size: 0.6rem; text-transform: uppercase; color: var(--accent); font-weight: 600; min-width: 70px; }
+		.detail-rel-path { color: var(--text-1); flex: 1; word-break: break-all; }
+		.detail-rel-dir { font-size: 0.55rem; color: var(--text-3); }
+		.detail-rel-remove { cursor: pointer; color: var(--text-3); font-size: 0.75rem; }
 		.detail-rel-remove:hover { color: var(--error); }
 		
-		.detail-files-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
-		.detail-file { background: var(--bg-3); cursor: pointer; border: 1px solid transparent; transition: border-color 0.1s; }
+		.detail-files-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; }
+		.detail-file { background: var(--bg-3); cursor: pointer; border: 1px solid transparent; }
 		.detail-file:hover { border-color: var(--accent); }
 		.detail-file-preview { aspect-ratio: 1; background: var(--bg-4); display: flex; align-items: center; justify-content: center; overflow: hidden; }
 		.detail-file-preview img, .detail-file-preview video { width: 100%; height: 100%; object-fit: cover; }
-		.detail-file-icon { font-size: 1.5rem; color: var(--text-3); }
-		.detail-file-info { padding: 8px; }
-		.detail-file-name { font-size: 0.75rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-		.detail-file-size { font-size: 0.65rem; color: var(--text-2); }
+		.detail-file-icon { font-size: 1.3rem; color: var(--text-3); }
+		.detail-file-info { padding: 6px; }
+		.detail-file-name { font-size: 0.7rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+		.detail-file-size { font-size: 0.6rem; color: var(--text-2); }
 		
-		.form-group { margin-bottom: 14px; }
-		.form-label { display: block; font-size: 0.7rem; color: var(--text-2); margin-bottom: 6px; text-transform: uppercase; }
-		.form-input, .form-textarea, .form-select { width: 100%; padding: 10px 12px; background: var(--bg-3); border: 1px solid var(--border); color: var(--text-0); font-size: 0.85rem; font-family: inherit; outline: none; }
+		.form-group { margin-bottom: 12px; }
+		.form-label { display: block; font-size: 0.65rem; color: var(--text-2); margin-bottom: 5px; text-transform: uppercase; }
+		.form-input, .form-textarea, .form-select { width: 100%; padding: 9px 11px; background: var(--bg-3); border: 1px solid var(--border); color: var(--text-0); font-size: 0.8rem; font-family: inherit; outline: none; }
 		.form-input:focus, .form-textarea:focus, .form-select:focus { border-color: var(--accent); }
-		.form-textarea { min-height: 80px; resize: vertical; font-family: monospace; }
-		.form-hint { font-size: 0.7rem; color: var(--text-3); margin-top: 4px; }
+		.form-textarea { min-height: 70px; resize: vertical; font-family: monospace; font-size: 0.75rem; }
+		.form-hint { font-size: 0.65rem; color: var(--text-3); margin-top: 4px; }
 		
-		.btn { padding: 8px 14px; font-size: 0.8rem; font-weight: 500; border: 1px solid var(--border); background: var(--bg-3); color: var(--text-0); cursor: pointer; transition: all 0.1s; font-family: inherit; }
+		.btn { padding: 7px 12px; font-size: 0.75rem; font-weight: 500; border: 1px solid var(--border); background: var(--bg-3); color: var(--text-0); cursor: pointer; font-family: inherit; }
 		.btn:hover { background: var(--bg-4); border-color: var(--text-3); }
 		.btn-primary { background: var(--accent); border-color: var(--accent); }
 		.btn-primary:hover { background: var(--accent-dim); }
-		.btn-sm { padding: 5px 10px; font-size: 0.7rem; }
+		.btn-sm { padding: 4px 8px; font-size: 0.65rem; }
 		.btn-danger { border-color: var(--error); color: var(--error); }
 		.btn-danger:hover { background: var(--error); color: white; }
 		.btn-block { width: 100%; }
 		
 		.modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.85); display: flex; align-items: center; justify-content: center; z-index: 1000; }
-		.modal { background: var(--bg-2); border: 1px solid var(--border); width: 100%; max-width: 500px; max-height: 90vh; overflow: auto; }
-		.modal-lg { max-width: 700px; }
-		.modal-header { padding: 16px 20px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
-		.modal-title { font-size: 1rem; font-weight: 600; }
-		.modal-close { background: none; border: none; color: var(--text-2); font-size: 1.5rem; cursor: pointer; line-height: 1; }
-		.modal-body { padding: 20px; }
-		.modal-footer { padding: 16px 20px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; gap: 8px; }
+		.modal { background: var(--bg-2); border: 1px solid var(--border); width: 100%; max-width: 480px; max-height: 90vh; overflow: auto; }
+		.modal-lg { max-width: 650px; }
+		.modal-header { padding: 14px 18px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+		.modal-title { font-size: 0.95rem; font-weight: 600; }
+		.modal-close { background: none; border: none; color: var(--text-2); font-size: 1.4rem; cursor: pointer; line-height: 1; }
+		.modal-body { padding: 18px; }
+		.modal-footer { padding: 14px 18px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; gap: 8px; }
 		
 		.tabs { display: flex; border-bottom: 1px solid var(--border); }
-		.tab { padding: 12px 16px; font-size: 0.8rem; color: var(--text-2); cursor: pointer; border-bottom: 2px solid transparent; }
+		.tab { padding: 10px 14px; font-size: 0.75rem; color: var(--text-2); cursor: pointer; border-bottom: 2px solid transparent; }
 		.tab:hover { color: var(--text-1); }
 		.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
 		.tab-content { display: none; }
 		.tab-content.active { display: block; }
 		
-		.upload-zone { border: 2px dashed var(--border); padding: 30px; text-align: center; cursor: pointer; }
+		.upload-zone { border: 2px dashed var(--border); padding: 25px; text-align: center; cursor: pointer; }
 		.upload-zone:hover, .upload-zone.dragover { border-color: var(--accent); }
-		.upload-zone-text { color: var(--text-2); font-size: 0.85rem; }
+		.upload-zone-text { color: var(--text-2); font-size: 0.8rem; }
 		
 		.lightbox { position: fixed; inset: 0; background: rgba(0,0,0,0.95); display: flex; align-items: center; justify-content: center; z-index: 2000; }
 		.lightbox img, .lightbox video { max-width: 95vw; max-height: 95vh; object-fit: contain; }
 		.lightbox-close { position: absolute; top: 16px; right: 16px; background: none; border: none; color: white; font-size: 2rem; cursor: pointer; }
 		
-		.toast { position: fixed; bottom: 20px; right: 20px; padding: 12px 20px; background: var(--bg-2); border: 1px solid var(--border); font-size: 0.85rem; z-index: 3000; animation: slideIn 0.2s ease; }
+		.toast { position: fixed; bottom: 20px; right: 20px; padding: 10px 18px; background: var(--bg-2); border: 1px solid var(--border); font-size: 0.8rem; z-index: 3000; animation: slideIn 0.2s ease; }
 		.toast.success { border-left: 3px solid var(--success); }
 		.toast.error { border-left: 3px solid var(--error); }
 		@keyframes slideIn { from { transform: translateY(20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
 		
 		.welcome { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; padding: 40px; text-align: center; }
-		.welcome h2 { font-size: 1.5rem; margin-bottom: 8px; }
-		.welcome p { color: var(--text-2); margin-bottom: 24px; }
+		.welcome h2 { font-size: 1.4rem; margin-bottom: 8px; }
+		.welcome p { color: var(--text-2); margin-bottom: 20px; font-size: 0.9rem; }
 		.welcome-actions { display: flex; gap: 12px; }
 		
-		.empty-state { padding: 60px 20px; text-align: center; color: var(--text-2); }
-		.empty-state h3 { color: var(--text-1); margin-bottom: 8px; }
+		.empty-state { padding: 50px 20px; text-align: center; color: var(--text-2); }
+		.empty-state h3 { color: var(--text-1); margin-bottom: 6px; font-size: 1rem; }
 		
 		.hidden { display: none !important; }
-		::-webkit-scrollbar { width: 8px; height: 8px; }
+		::-webkit-scrollbar { width: 7px; height: 7px; }
 		::-webkit-scrollbar-track { background: var(--bg-1); }
 		::-webkit-scrollbar-thumb { background: var(--border); }
 		::-webkit-scrollbar-thumb:hover { background: var(--text-3); }
@@ -1356,7 +1612,7 @@ def get_app_html() -> str:
 		
 		<div class="main">
 			<aside class="sidebar" id="sidebar">
-				<div class="sidebar-header"><span>Browser</span><button class="btn btn-sm" onclick="refreshTree()">↻</button></div>
+				<div class="sidebar-header"><span>Browser</span><button class="btn btn-sm" style="padding:3px 6px" onclick="refreshTree()">↻</button></div>
 				<div class="tree-container" id="treeContainer"></div>
 			</aside>
 			
@@ -1374,27 +1630,25 @@ def get_app_html() -> str:
 					<div class="search-container">
 						<div class="search-row">
 							<div class="search-input-wrap">
-								<input type="text" class="search-input" id="searchInput" placeholder="Search... (tag:name, key:value, key=value)" autocomplete="off">
+								<input type="text" class="search-input" id="searchInput" placeholder="Search..." autocomplete="off">
 								<div class="autocomplete-dropdown" id="autocompleteDropdown"></div>
 							</div>
 							<button class="btn btn-primary" onclick="executeSearch()">Search</button>
 						</div>
-						<div class="search-hint">
-							<code>tag:value</code> tag contains &nbsp;
-							<code>tag=value</code> tag equals &nbsp;
-							<code>key:value</code> metadata contains &nbsp;
-							<code>key=value</code> metadata equals &nbsp;
-							<code>key</code> metadata exists
+						<div class="search-hints">
+							<div class="search-hints-row"><code>tag:val</code> tag contains <code>tag=val</code> tag equals <code>key:val</code> metadata contains <code>key=val</code> metadata equals <code>key</code> key exists</div>
+							<div class="search-hints-row"><code>RELATION</code> has relationship type <code>!path</code> related to path <code>!path:REL</code> with relation <code>!path:REL&gt;</code> outgoing <code>!path:REL&lt;</code> incoming</div>
+							<div class="search-hints-row"><code>^...</code> deep search (children inherit) <code>%...</code> reverse deep (parents inherit)</div>
 						</div>
 						<div class="filter-bar" id="filterBar">
-							<button class="filter-add" onclick="showAdvancedFilterModal()">+ Advanced Filter</button>
+							<button class="filter-add" onclick="showAdvFilterModal()">+ Filter</button>
 						</div>
 					</div>
 					
 					<div class="results-container">
 						<div class="results-header">
 							<span id="resultsCount">0 results</span>
-							<select class="form-select" style="width:auto;padding:4px 8px;font-size:0.75rem" onchange="setTypeFilter(this.value)">
+							<select class="form-select" style="width:auto;padding:3px 6px;font-size:0.7rem" onchange="setTypeFilter(this.value)">
 								<option value="">All Types</option>
 								<option value="VAULT">Vaults</option>
 								<option value="RECORD">Records</option>
@@ -1407,7 +1661,7 @@ def get_app_html() -> str:
 			
 			<aside class="detail-panel hidden" id="detailPanel">
 				<div class="detail-header">
-					<div><div class="detail-title" id="detailTitle"></div><div style="font-size:0.75rem;color:var(--text-2);margin-top:4px" id="detailPath"></div></div>
+					<div><div class="detail-title" id="detailTitle"></div><div style="font-size:0.7rem;color:var(--text-2);margin-top:3px" id="detailPath"></div></div>
 					<button class="detail-close" onclick="closeDetailPanel()">&times;</button>
 				</div>
 				<div class="detail-body" id="detailBody"></div>
@@ -1418,615 +1672,266 @@ def get_app_html() -> str:
 	<div class="lightbox hidden" id="lightbox" onclick="closeLightbox(event)"><button class="lightbox-close">&times;</button><div id="lightboxContent"></div></div>
 	
 	<script>
-	let archiveOpen = false, selectedPath = null, advancedFilters = [], typeFilter = '', currentNodeData = null, expandedNodes = new Set();
+	let archiveOpen = false, selectedPath = null, advFilters = [], typeFilter = '', currentNode = null, expandedNodes = new Set();
 	let acIndex = -1, acItems = [];
 	
-	async function api(method, path, body = null) {
-		const opts = { method, headers: {} };
-		if (body && !(body instanceof FormData)) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
-		else if (body) { opts.body = body; }
-		const res = await fetch(path, opts);
-		const data = await res.json();
-		if (!res.ok) throw new Error(data.error || 'Request failed');
-		return data;
+	async function api(m, p, b = null) {
+		const o = { method: m, headers: {} };
+		if (b && !(b instanceof FormData)) { o.headers['Content-Type'] = 'application/json'; o.body = JSON.stringify(b); }
+		else if (b) o.body = b;
+		const r = await fetch(p, o);
+		const d = await r.json();
+		if (!r.ok) throw new Error(d.error || 'Failed');
+		return d;
 	}
 	
-	function toast(msg, type = 'info') { const el = document.createElement('div'); el.className = `toast ${type}`; el.textContent = msg; document.body.appendChild(el); setTimeout(() => el.remove(), 3000); }
+	function toast(m, t = 'info') { const e = document.createElement('div'); e.className = `toast ${t}`; e.textContent = m; document.body.appendChild(e); setTimeout(() => e.remove(), 3000); }
 	function formatSize(b) { if (!b) return '0 B'; const k = 1024, s = ['B','KB','MB','GB'], i = Math.floor(Math.log(b)/Math.log(k)); return parseFloat((b/Math.pow(k,i)).toFixed(1))+' '+s[i]; }
-	function closeModal(el) { el.closest('.modal-overlay')?.remove(); }
-	function escapeHtml(s) { return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+	function closeModal(e) { e.closest('.modal-overlay')?.remove(); }
+	function esc(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+	function debounce(f, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => f(...a), ms); }; }
 	
-	// === Autocomplete ===
-	const searchInput = document.getElementById('searchInput');
-	const acDropdown = document.getElementById('autocompleteDropdown');
+	// Autocomplete
+	const sInput = document.getElementById('searchInput'), acDrop = document.getElementById('autocompleteDropdown');
+	sInput.addEventListener('input', debounce(handleAcInput, 150));
+	sInput.addEventListener('keydown', handleAcKey);
+	sInput.addEventListener('blur', () => setTimeout(() => acDrop.classList.remove('show'), 150));
 	
-	searchInput.addEventListener('input', debounce(handleSearchInput, 150));
-	searchInput.addEventListener('keydown', handleSearchKeydown);
-	searchInput.addEventListener('blur', () => setTimeout(() => acDropdown.classList.remove('show'), 150));
-	
-	function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
-	
-	async function handleSearchInput() {
-		const val = searchInput.value;
-		const cursorPos = searchInput.selectionStart;
-		const { token, context, query } = parseCurrentToken(val, cursorPos);
-		
-		if (!token && !query) { acDropdown.classList.remove('show'); return; }
-		
+	async function handleAcInput() {
+		const val = sInput.value, pos = sInput.selectionStart;
+		const { context, query } = parseToken(val, pos);
+		if (!context && !query) { acDrop.classList.remove('show'); return; }
 		try {
-			const data = await api('GET', `/api/autocomplete?context=${encodeURIComponent(context)}&q=${encodeURIComponent(query)}`);
-			acItems = data.suggestions || [];
-			renderAutocomplete();
-		} catch (e) { acItems = []; acDropdown.classList.remove('show'); }
+			const d = await api('GET', `/api/autocomplete?context=${encodeURIComponent(context)}&q=${encodeURIComponent(query)}`);
+			acItems = d.suggestions || [];
+			renderAc();
+		} catch { acItems = []; acDrop.classList.remove('show'); }
 	}
 	
-	function parseCurrentToken(val, pos) {
-		// Find token boundaries
+	function parseToken(val, pos) {
 		let start = pos, end = pos;
 		while (start > 0 && val[start-1] !== ' ') start--;
 		while (end < val.length && val[end] !== ' ') end++;
+		let token = val.substring(start, end);
 		
-		const token = val.substring(start, end);
+		// Strip modifiers
+		let mod = '';
+		if (token.startsWith('^') || token.startsWith('%')) { mod = token[0]; token = token.slice(1); }
+		
 		let context = 'start', query = token;
 		
-		if (token.toLowerCase().startsWith('tag:')) { context = 'tag:'; query = token.slice(4); }
+		if (token.startsWith('!')) {
+			const inner = token.slice(1);
+			if (inner.includes(':')) {
+				context = '!:';
+				query = inner.split(':')[1]?.replace(/[<>]$/, '') || '';
+			} else {
+				context = '!';
+				query = inner.replace(/[<>]$/, '');
+			}
+		} else if (token.toLowerCase().startsWith('tag:')) { context = 'tag:'; query = token.slice(4); }
 		else if (token.toLowerCase().startsWith('tag=')) { context = 'tag='; query = token.slice(4); }
-		else if (token.includes(':')) {
-			const [key, v] = token.split(':', 2);
-			context = `meta:${key}:`; query = v || '';
-		} else if (token.includes('=')) {
-			const [key, v] = token.split('=', 2);
-			context = `meta:${key}=`; query = v || '';
-		} else {
-			context = 'key'; query = token;
-		}
+		else if (token.includes(':')) { const [k, v] = token.split(':', 2); context = `meta:${k}:`; query = v || ''; }
+		else if (token.includes('=')) { const [k, v] = token.split('=', 2); context = `meta:${k}=`; query = v || ''; }
+		else { context = 'key'; query = token; }
 		
-		return { token, context, query, start, end };
+		return { context, query, start, end, mod };
 	}
 	
-	function renderAutocomplete() {
-		if (acItems.length === 0) { acDropdown.classList.remove('show'); return; }
+	function renderAc() {
+		if (!acItems.length) { acDrop.classList.remove('show'); return; }
 		acIndex = -1;
-		acDropdown.innerHTML = acItems.map((item, i) => `
-			<div class="autocomplete-item" data-index="${i}" onmousedown="selectAutocomplete(${i})">
-				<span class="autocomplete-item-label">${escapeHtml(item.label)}</span>
-				<span class="autocomplete-item-hint">${escapeHtml(item.hint || '')}</span>
-			</div>
-		`).join('');
-		acDropdown.classList.add('show');
+		acDrop.innerHTML = acItems.map((it, i) => `<div class="autocomplete-item" data-i="${i}" onmousedown="selectAc(${i})"><span>${esc(it.label)}</span><span class="autocomplete-item-hint">${esc(it.hint||'')}</span></div>`).join('');
+		acDrop.classList.add('show');
 	}
 	
-	function handleSearchKeydown(e) {
-		if (!acDropdown.classList.contains('show')) {
-			if (e.key === 'Enter') { e.preventDefault(); executeSearch(); }
-			return;
-		}
-		if (e.key === 'ArrowDown') { e.preventDefault(); acIndex = Math.min(acIndex + 1, acItems.length - 1); updateAcSelection(); }
-		else if (e.key === 'ArrowUp') { e.preventDefault(); acIndex = Math.max(acIndex - 1, 0); updateAcSelection(); }
-		else if (e.key === 'Enter' && acIndex >= 0) { e.preventDefault(); selectAutocomplete(acIndex); }
-		else if (e.key === 'Escape') { acDropdown.classList.remove('show'); }
+	function handleAcKey(e) {
+		if (!acDrop.classList.contains('show')) { if (e.key === 'Enter') { e.preventDefault(); executeSearch(); } return; }
+		if (e.key === 'ArrowDown') { e.preventDefault(); acIndex = Math.min(acIndex + 1, acItems.length - 1); updateAcSel(); }
+		else if (e.key === 'ArrowUp') { e.preventDefault(); acIndex = Math.max(acIndex - 1, 0); updateAcSel(); }
+		else if (e.key === 'Enter' && acIndex >= 0) { e.preventDefault(); selectAc(acIndex); }
+		else if (e.key === 'Escape') { acDrop.classList.remove('show'); }
 		else if (e.key === 'Enter') { e.preventDefault(); executeSearch(); }
 	}
 	
-	function updateAcSelection() {
-		acDropdown.querySelectorAll('.autocomplete-item').forEach((el, i) => el.classList.toggle('selected', i === acIndex));
-		const sel = acDropdown.querySelector('.autocomplete-item.selected');
-		if (sel) sel.scrollIntoView({ block: 'nearest' });
-	}
+	function updateAcSel() { acDrop.querySelectorAll('.autocomplete-item').forEach((el, i) => el.classList.toggle('selected', i === acIndex)); const s = acDrop.querySelector('.selected'); if (s) s.scrollIntoView({ block: 'nearest' }); }
 	
-	function selectAutocomplete(index) {
-		const item = acItems[index];
-		if (!item) return;
+	function selectAc(i) {
+		const it = acItems[i]; if (!it) return;
+		const val = sInput.value, pos = sInput.selectionStart;
+		const { start, end, context, mod } = parseToken(val, pos);
 		
-		const val = searchInput.value;
-		const pos = searchInput.selectionStart;
-		const { start, end, context } = parseCurrentToken(val, pos);
+		let rep = it.value;
+		if (it.type === 'key' || it.type === 'prefix') rep = it.value + (it.value.endsWith(':') || it.value.endsWith('!') ? '' : ':');
 		
-		let replacement = item.value;
-		if (item.type === 'key' || item.type === 'prefix') {
-			replacement = item.value + (item.value.endsWith(':') ? '' : ':');
-		}
-		
-		// If we're completing a value after : or =, just replace the value part
-		if (context.startsWith('meta:') || context.startsWith('tag')) {
-			const colonPos = val.lastIndexOf(':', end);
-			const eqPos = val.lastIndexOf('=', end);
-			const opPos = Math.max(colonPos, eqPos);
-			if (opPos > start) {
-				const before = val.substring(0, opPos + 1);
-				const after = val.substring(end);
-				searchInput.value = before + replacement + after;
-				searchInput.selectionStart = searchInput.selectionEnd = before.length + replacement.length;
-				acDropdown.classList.remove('show');
+		// Value completion
+		if (context.startsWith('meta:') || context.startsWith('tag') || context === '!:') {
+			const opIdx = Math.max(val.lastIndexOf(':', end), val.lastIndexOf('=', end));
+			if (opIdx > start) {
+				const before = val.substring(0, opIdx + 1), after = val.substring(end);
+				sInput.value = before + rep + after;
+				sInput.selectionStart = sInput.selectionEnd = before.length + rep.length;
+				acDrop.classList.remove('show');
 				return;
 			}
 		}
 		
-		const before = val.substring(0, start);
-		const after = val.substring(end);
-		searchInput.value = before + replacement + after;
-		searchInput.selectionStart = searchInput.selectionEnd = before.length + replacement.length;
-		acDropdown.classList.remove('show');
-		
-		// Trigger another autocomplete if we added a prefix
-		if (item.type === 'key' || item.type === 'prefix') {
-			setTimeout(() => handleSearchInput(), 50);
+		// Path completion for !
+		if (context === '!') {
+			const before = val.substring(0, start) + mod + '!', after = val.substring(end);
+			sInput.value = before + rep + after;
+			sInput.selectionStart = sInput.selectionEnd = before.length + rep.length;
+			acDrop.classList.remove('show');
+			return;
 		}
+		
+		const before = val.substring(0, start) + mod, after = val.substring(end);
+		sInput.value = before + rep + after;
+		sInput.selectionStart = sInput.selectionEnd = before.length + rep.length;
+		acDrop.classList.remove('show');
+		
+		if (it.type === 'key' || it.type === 'prefix') setTimeout(() => handleAcInput(), 50);
 	}
 	
-	// === Search ===
+	// Search
 	async function executeSearch() {
 		if (!archiveOpen) return;
-		acDropdown.classList.remove('show');
-		
-		const q = searchInput.value.trim();
+		acDrop.classList.remove('show');
+		const q = sInput.value.trim();
 		const filters = {};
-		
 		if (typeFilter) filters.type = typeFilter;
-		
-		for (const f of advancedFilters) {
+		for (const f of advFilters) {
 			if (f.type === 'inside') filters.inside = f.value;
-			else if (f.type === 'related_to') {
-				const parts = f.value.split(':');
-				filters.related_to = { target: parts[0], relation: parts[1] || null };
-			}
 		}
-		
 		try {
-			const data = await api('POST', '/api/smart-search', { q, filters, limit: 200 });
-			renderResults(data.results);
+			const d = await api('POST', '/api/smart-search', { q, filters, limit: 200 });
+			renderResults(d.results);
 		} catch (e) { toast(e.message, 'error'); }
 	}
 	
 	function renderResults(results) {
 		const grid = document.getElementById('resultsGrid');
 		document.getElementById('resultsCount').textContent = `${results.length} result${results.length !== 1 ? 's' : ''}`;
-		
-		if (results.length === 0) {
-			grid.innerHTML = '<div class="empty-state"><h3>No results</h3><p>Try adjusting your search.</p></div>';
-			return;
-		}
+		if (!results.length) { grid.innerHTML = '<div class="empty-state"><h3>No results</h3><p>Try different search terms.</p></div>'; return; }
 		
 		grid.innerHTML = results.map(r => {
-			const meta = r.metadata || {};
+			const meta = r.metadata || {}, tags = r.tags || [];
 			const metaKeys = Object.keys(meta).slice(0, 2);
-			const tags = r.tags || [];
+			const hasPreview = r.preview_hash && r.preview_ext;
+			const isImg = hasPreview && ['jpg','jpeg','png','gif','webp','bmp'].includes(r.preview_ext);
+			const isVid = hasPreview && ['mp4','webm','mov'].includes(r.preview_ext);
 			
-			return `
-				<div class="result-card" onclick="selectNode('${escapeHtml(r.path)}')">
-					<div class="result-header">
-						<span class="result-icon">${r.type === 'VAULT' ? '📁' : '📄'}</span>
-						<div class="result-info">
-							<div class="result-name">${escapeHtml(r.name)}</div>
-							<div class="result-path">${escapeHtml(r.path)}</div>
-						</div>
-						<span class="result-type">${r.type}</span>
-					</div>
+			return `<div class="result-card" onclick="selectNode('${esc(r.path)}')">
+				<div class="result-preview">
+					${isImg ? `<img src="/api/blob/${r.preview_hash}" loading="lazy">` : isVid ? `<video src="/api/blob/${r.preview_hash}" muted></video>` : `<span class="result-preview-icon">${r.type === 'VAULT' ? '📁' : '📄'}</span>`}
+				</div>
+				<div class="result-body">
+					<div class="result-header"><span class="result-name">${esc(r.name)}</span><span class="result-type">${r.type}</span></div>
+					<div class="result-path">${esc(r.path)}</div>
 					<div class="result-meta">
-						${tags.slice(0,3).map(t => `<span class="result-tag is-tag">${escapeHtml(t)}</span>`).join('')}
-						${metaKeys.map(k => `<span class="result-tag">${escapeHtml(k)}: ${escapeHtml(String(meta[k]).substring(0,20))}</span>`).join('')}
+						${tags.slice(0,2).map(t => `<span class="result-tag is-tag">${esc(t)}</span>`).join('')}
+						${metaKeys.map(k => `<span class="result-tag">${esc(k)}: ${esc(String(meta[k]).substring(0,15))}</span>`).join('')}
 					</div>
 				</div>
-			`;
+			</div>`;
 		}).join('');
 	}
 	
 	function setTypeFilter(t) { typeFilter = t; executeSearch(); }
 	
-	// === Advanced Filters ===
-	function showAdvancedFilterModal() {
-		const modal = document.createElement('div');
-		modal.className = 'modal-overlay';
-		modal.innerHTML = `
-			<div class="modal">
-				<div class="modal-header"><span class="modal-title">Add Advanced Filter</span><button class="modal-close" onclick="closeModal(this)">&times;</button></div>
-				<div class="modal-body">
-					<div class="form-group">
-						<label class="form-label">Filter Type</label>
-						<select class="form-select" id="advFilterType">
-							<option value="inside">Inside Path (prefix)</option>
-							<option value="related_to">Related To (path:RELATION)</option>
-						</select>
-					</div>
-					<div class="form-group">
-						<label class="form-label">Value</label>
-						<input type="text" class="form-input" id="advFilterValue" placeholder="Enter value">
-					</div>
-				</div>
-				<div class="modal-footer"><button class="btn" onclick="closeModal(this)">Cancel</button><button class="btn btn-primary" onclick="addAdvancedFilter()">Add</button></div>
-			</div>
-		`;
-		document.body.appendChild(modal);
+	function showAdvFilterModal() {
+		const m = document.createElement('div'); m.className = 'modal-overlay';
+		m.innerHTML = `<div class="modal"><div class="modal-header"><span class="modal-title">Add Filter</span><button class="modal-close" onclick="closeModal(this)">&times;</button></div>
+			<div class="modal-body"><div class="form-group"><label class="form-label">Filter Type</label><select class="form-select" id="advFType"><option value="inside">Inside Path</option></select></div>
+			<div class="form-group"><label class="form-label">Value</label><input type="text" class="form-input" id="advFVal"></div></div>
+			<div class="modal-footer"><button class="btn" onclick="closeModal(this)">Cancel</button><button class="btn btn-primary" onclick="addAdvFilter()">Add</button></div></div>`;
+		document.body.appendChild(m);
+	}
+	function addAdvFilter() { const t = document.getElementById('advFType').value, v = document.getElementById('advFVal').value.trim(); if (!v) { toast('Value required', 'error'); return; } advFilters.push({type:t,value:v}); renderAdvFilters(); closeModal(document.querySelector('.modal-overlay .modal')); executeSearch(); }
+	function removeAdvFilter(i) { advFilters.splice(i, 1); renderAdvFilters(); executeSearch(); }
+	function renderAdvFilters() { document.getElementById('filterBar').innerHTML = advFilters.map((f, i) => `<span class="filter-chip"><b>${f.type}:</b> ${esc(f.value)}<span class="remove" onclick="removeAdvFilter(${i})">×</span></span>`).join('') + '<button class="filter-add" onclick="showAdvFilterModal()">+ Filter</button>'; }
+	
+	// Archive
+	async function checkStatus() { const d = await api('GET', '/api/status'); archiveOpen = d.archive_open; updateUI(d); }
+	function updateUI(s) {
+		const info = document.getElementById('archiveInfo'), wel = document.getElementById('welcomeScreen'), main = document.getElementById('mainUI'), side = document.getElementById('sidebar');
+		if (s.archive_open) {
+			const n = s.archive_path.split(/[/\\\\]/).pop();
+			info.innerHTML = `<span class="path" title="${esc(s.archive_path)}">${esc(n)}</span>${s.encrypted ? '<span class="archive-badge encrypted">Encrypted</span>' : ''}<span style="color:var(--text-2)">${s.stats.nodes} nodes · ${formatSize(s.stats.total_size)}</span>`;
+			wel.classList.add('hidden'); main.classList.remove('hidden'); side.style.display = 'flex'; refreshTree();
+		} else { info.innerHTML = '<span style="color:var(--text-3)">No archive open</span>'; wel.classList.remove('hidden'); main.classList.add('hidden'); side.style.display = 'none'; closeDetailPanel(); }
 	}
 	
-	function addAdvancedFilter() {
-		const type = document.getElementById('advFilterType').value;
-		const value = document.getElementById('advFilterValue').value.trim();
-		if (!value) { toast('Value required', 'error'); return; }
-		advancedFilters.push({ type, value });
-		renderAdvancedFilters();
-		closeModal(document.querySelector('.modal-overlay .modal'));
-		executeSearch();
-	}
+	function showOpenArchiveModal() { const m = document.createElement('div'); m.className = 'modal-overlay'; m.innerHTML = `<div class="modal"><div class="modal-header"><span class="modal-title">Open Archive</span><button class="modal-close" onclick="closeModal(this)">&times;</button></div><div class="modal-body"><div class="form-group"><label class="form-label">Path</label><input type="text" class="form-input" id="openPath"></div><div class="form-group"><label class="form-label">Password</label><input type="password" class="form-input" id="openPwd"></div></div><div class="modal-footer"><button class="btn" onclick="closeModal(this)">Cancel</button><button class="btn btn-primary" onclick="openArchive()">Open</button></div></div>`; document.body.appendChild(m); m.querySelector('#openPath').focus(); }
+	async function openArchive() { const p = document.getElementById('openPath').value.trim(), w = document.getElementById('openPwd').value || null; if (!p) { toast('Path required', 'error'); return; } try { await api('POST', '/api/archive/open', { path: p, password: w }); closeModal(document.querySelector('.modal-overlay .modal')); await checkStatus(); toast('Opened', 'success'); } catch (e) { toast(e.message, 'error'); } }
 	
-	function removeAdvancedFilter(i) { advancedFilters.splice(i, 1); renderAdvancedFilters(); executeSearch(); }
+	function showCreateArchiveModal() { const m = document.createElement('div'); m.className = 'modal-overlay'; m.innerHTML = `<div class="modal"><div class="modal-header"><span class="modal-title">Create Archive</span><button class="modal-close" onclick="closeModal(this)">&times;</button></div><div class="modal-body"><div class="form-group"><label class="form-label">Path</label><input type="text" class="form-input" id="createPath"></div><div class="form-group"><label class="form-label">Password</label><input type="password" class="form-input" id="createPwd"></div><div class="form-group"><label class="form-label">Partition</label><select class="form-select" id="createPart"><option value="0">Disabled</option><option value="26214400">25MB</option><option value="52428800" selected>50MB</option><option value="104857600">100MB</option></select></div></div><div class="modal-footer"><button class="btn" onclick="closeModal(this)">Cancel</button><button class="btn btn-primary" onclick="createArchive()">Create</button></div></div>`; document.body.appendChild(m); }
+	async function createArchive() { const p = document.getElementById('createPath').value.trim(), w = document.getElementById('createPwd').value || null, s = parseInt(document.getElementById('createPart').value); if (!p) { toast('Path required', 'error'); return; } try { await api('POST', '/api/archive/create', { path: p, password: w, partition_size: s }); closeModal(document.querySelector('.modal-overlay .modal')); await checkStatus(); toast('Created', 'success'); } catch (e) { toast(e.message, 'error'); } }
 	
-	function renderAdvancedFilters() {
-		const bar = document.getElementById('filterBar');
-		bar.innerHTML = advancedFilters.map((f, i) => `
-			<span class="filter-chip"><strong>${f.type}:</strong> ${escapeHtml(f.value)}<span class="remove" onclick="removeAdvancedFilter(${i})">×</span></span>
-		`).join('') + '<button class="filter-add" onclick="showAdvancedFilterModal()">+ Advanced Filter</button>';
-	}
-	
-	// === Archive ===
-	async function checkStatus() {
-		const data = await api('GET', '/api/status');
-		archiveOpen = data.archive_open;
-		updateUI(data);
-	}
-	
-	function updateUI(status) {
-		const info = document.getElementById('archiveInfo');
-		const welcome = document.getElementById('welcomeScreen');
-		const mainUI = document.getElementById('mainUI');
-		const sidebar = document.getElementById('sidebar');
-		
-		if (status.archive_open) {
-			const name = status.archive_path.split(/[/\\\\]/).pop();
-			info.innerHTML = `<span class="path" title="${escapeHtml(status.archive_path)}">${escapeHtml(name)}</span>
-				${status.encrypted ? '<span class="archive-badge encrypted">Encrypted</span>' : ''}
-				<span style="color:var(--text-2)">${status.stats.nodes} nodes · ${formatSize(status.stats.total_size)}</span>`;
-			welcome.classList.add('hidden');
-			mainUI.classList.remove('hidden');
-			sidebar.style.display = 'flex';
-			refreshTree();
-		} else {
-			info.innerHTML = '<span style="color:var(--text-3)">No archive open</span>';
-			welcome.classList.remove('hidden');
-			mainUI.classList.add('hidden');
-			sidebar.style.display = 'none';
-			closeDetailPanel();
-		}
-	}
-	
-	function showOpenArchiveModal() {
-		const modal = document.createElement('div');
-		modal.className = 'modal-overlay';
-		modal.innerHTML = `<div class="modal"><div class="modal-header"><span class="modal-title">Open Archive</span><button class="modal-close" onclick="closeModal(this)">&times;</button></div>
-			<div class="modal-body"><div class="form-group"><label class="form-label">Path</label><input type="text" class="form-input" id="openPath" placeholder="/path/to/archive"></div>
-			<div class="form-group"><label class="form-label">Password (if encrypted)</label><input type="password" class="form-input" id="openPassword"></div></div>
-			<div class="modal-footer"><button class="btn" onclick="closeModal(this)">Cancel</button><button class="btn btn-primary" onclick="openArchive()">Open</button></div></div>`;
-		document.body.appendChild(modal);
-		modal.querySelector('#openPath').focus();
-	}
-	
-	async function openArchive() {
-		const path = document.getElementById('openPath').value.trim();
-		const password = document.getElementById('openPassword').value || null;
-		if (!path) { toast('Path required', 'error'); return; }
-		try { await api('POST', '/api/archive/open', { path, password }); closeModal(document.querySelector('.modal-overlay .modal')); await checkStatus(); toast('Opened', 'success'); }
-		catch (e) { toast(e.message, 'error'); }
-	}
-	
-	function showCreateArchiveModal() {
-		const modal = document.createElement('div');
-		modal.className = 'modal-overlay';
-		modal.innerHTML = `<div class="modal"><div class="modal-header"><span class="modal-title">Create Archive</span><button class="modal-close" onclick="closeModal(this)">&times;</button></div>
-			<div class="modal-body"><div class="form-group"><label class="form-label">Path</label><input type="text" class="form-input" id="createArchivePath" placeholder="/path/to/archive"></div>
-			<div class="form-group"><label class="form-label">Password</label><input type="password" class="form-input" id="createArchivePassword" placeholder="Leave empty for no encryption"></div>
-			<div class="form-group"><label class="form-label">Partition Size</label><select class="form-select" id="createArchivePartition">
-				<option value="0">Disabled</option><option value="26214400">25 MB</option><option value="52428800" selected>50 MB</option><option value="104857600">100 MB</option>
-			</select></div></div>
-			<div class="modal-footer"><button class="btn" onclick="closeModal(this)">Cancel</button><button class="btn btn-primary" onclick="createArchive()">Create</button></div></div>`;
-		document.body.appendChild(modal);
-	}
-	
-	async function createArchive() {
-		const path = document.getElementById('createArchivePath').value.trim();
-		const password = document.getElementById('createArchivePassword').value || null;
-		const partition_size = parseInt(document.getElementById('createArchivePartition').value);
-		if (!path) { toast('Path required', 'error'); return; }
-		try { await api('POST', '/api/archive/create', { path, password, partition_size }); closeModal(document.querySelector('.modal-overlay .modal')); await checkStatus(); toast('Created', 'success'); }
-		catch (e) { toast(e.message, 'error'); }
-	}
-	
-	// === Tree ===
-	async function loadChildren(parentUuid, container, depth = 0) {
-		try {
-			const data = await api('GET', `/api/children/${parentUuid || ''}`);
-			for (const c of data.children) {
-				const node = document.createElement('div');
-				node.className = 'tree-node';
-				node.dataset.uuid = c.uuid;
-				node.dataset.path = c.path;
-				
-				const row = document.createElement('div');
-				row.className = 'tree-item';
-				row.style.paddingLeft = `${12 + depth * 14}px`;
-				
-				const toggle = document.createElement('span');
-				toggle.className = `tree-toggle ${c.hasChildren ? '' : 'hidden'} ${expandedNodes.has(c.uuid) ? 'expanded' : ''}`;
-				toggle.textContent = '▶';
-				
-				const icon = document.createElement('span');
-				icon.className = 'tree-icon';
-				icon.textContent = c.type === 'VAULT' ? '📁' : '📄';
-				
-				const name = document.createElement('span');
-				name.className = 'tree-name';
-				name.textContent = c.name;
-				
-				row.append(toggle, icon, name);
-				row.onclick = (e) => { e.stopPropagation(); if (e.target === toggle && c.hasChildren) toggleTreeNode(c.uuid, node, depth); else selectNode(c.path); };
-				
-				const cc = document.createElement('div');
-				cc.className = `tree-children ${expandedNodes.has(c.uuid) ? 'expanded' : ''}`;
-				node.append(row, cc);
-				container.appendChild(node);
-				
-				if (expandedNodes.has(c.uuid) && c.hasChildren) await loadChildren(c.uuid, cc, depth + 1);
-			}
-		} catch (e) { console.error(e); }
-	}
-	
-	async function toggleTreeNode(uuid, node, depth) {
-		const toggle = node.querySelector('.tree-toggle');
-		const cc = node.querySelector('.tree-children');
-		if (expandedNodes.has(uuid)) { expandedNodes.delete(uuid); toggle.classList.remove('expanded'); cc.classList.remove('expanded'); cc.innerHTML = ''; }
-		else { expandedNodes.add(uuid); toggle.classList.add('expanded'); cc.classList.add('expanded'); await loadChildren(uuid, cc, depth + 1); }
-	}
-	
+	// Tree
+	async function loadChildren(pUuid, cont, depth = 0) { try { const d = await api('GET', `/api/children/${pUuid || ''}`); for (const c of d.children) { const n = document.createElement('div'); n.className = 'tree-node'; n.dataset.uuid = c.uuid; n.dataset.path = c.path; const r = document.createElement('div'); r.className = 'tree-item'; r.style.paddingLeft = `${10 + depth * 12}px`; const t = document.createElement('span'); t.className = `tree-toggle ${c.hasChildren ? '' : 'hidden'} ${expandedNodes.has(c.uuid) ? 'expanded' : ''}`; t.textContent = '▶'; const i = document.createElement('span'); i.className = 'tree-icon'; i.textContent = c.type === 'VAULT' ? '📁' : '📄'; const nm = document.createElement('span'); nm.className = 'tree-name'; nm.textContent = c.name; r.append(t, i, nm); r.onclick = e => { e.stopPropagation(); if (e.target === t && c.hasChildren) toggleTree(c.uuid, n, depth); else selectNode(c.path); }; const cc = document.createElement('div'); cc.className = `tree-children ${expandedNodes.has(c.uuid) ? 'expanded' : ''}`; n.append(r, cc); cont.appendChild(n); if (expandedNodes.has(c.uuid) && c.hasChildren) await loadChildren(c.uuid, cc, depth + 1); } } catch (e) { console.error(e); } }
+	async function toggleTree(uuid, n, depth) { const t = n.querySelector('.tree-toggle'), cc = n.querySelector('.tree-children'); if (expandedNodes.has(uuid)) { expandedNodes.delete(uuid); t.classList.remove('expanded'); cc.classList.remove('expanded'); cc.innerHTML = ''; } else { expandedNodes.add(uuid); t.classList.add('expanded'); cc.classList.add('expanded'); await loadChildren(uuid, cc, depth + 1); } }
 	async function refreshTree() { document.getElementById('treeContainer').innerHTML = ''; await loadChildren(null, document.getElementById('treeContainer'), 0); }
 	
-	// === Detail Panel ===
-	async function selectNode(path) {
-		selectedPath = path;
-		document.querySelectorAll('.tree-item').forEach(el => el.classList.remove('selected'));
-		const tn = document.querySelector(`[data-path="${path}"] > .tree-item`);
-		if (tn) tn.classList.add('selected');
-		try { const node = await api('GET', `/api/node/${encodeURIComponent(path)}`); currentNodeData = node; renderDetailPanel(node); }
-		catch (e) { toast(e.message, 'error'); }
+	// Detail
+	async function selectNode(path) { selectedPath = path; document.querySelectorAll('.tree-item').forEach(e => e.classList.remove('selected')); const tn = document.querySelector(`[data-path="${path}"] > .tree-item`); if (tn) tn.classList.add('selected'); try { const n = await api('GET', `/api/node/${encodeURIComponent(path)}`); currentNode = n; renderDetail(n); } catch (e) { toast(e.message, 'error'); } }
+	
+	function renderDetail(n) {
+		const p = document.getElementById('detailPanel'); p.classList.remove('hidden');
+		document.getElementById('detailTitle').textContent = n.name;
+		document.getElementById('detailPath').textContent = n.path;
+		let h = '';
+		const meta = n.metadata || {};
+		h += `<div class="detail-section"><div class="detail-section-title">Metadata <button class="btn btn-sm" onclick="showEditMeta()">Edit</button></div>${Object.keys(meta).length ? `<div class="detail-meta-grid">${Object.entries(meta).map(([k,v]) => `<div class="detail-meta-item ${String(v).length > 40 ? 'full' : ''}"><div class="detail-meta-label">${esc(k)}</div><div class="detail-meta-value">${esc(typeof v === 'object' ? JSON.stringify(v) : String(v))}</div></div>`).join('')}</div>` : '<div style="color:var(--text-3);font-size:0.8rem">No metadata</div>'}</div>`;
+		h += `<div class="detail-section"><div class="detail-section-title">Tags</div><div class="detail-tags">${n.tags.map(t => `<span class="detail-tag">${esc(t)}<span class="remove" onclick="remTag('${esc(t)}')">×</span></span>`).join('')}<button class="btn btn-sm" onclick="showAddTag()">+</button></div></div>`;
+		h += `<div class="detail-section"><div class="detail-section-title">Relationships</div>`;
+		for (const r of n.relationships) h += `<div class="detail-rel-item"><span class="detail-rel-type">${esc(r.relation)}</span><span class="detail-rel-path" onclick="selectNode('${esc(r.target_path)}')">${esc(r.target_path)}</span><span class="detail-rel-dir">→</span><span class="detail-rel-remove" onclick="remRel('${esc(n.path)}','${esc(r.target_path)}','${esc(r.relation)}')">×</span></div>`;
+		for (const r of n.incoming_relationships) h += `<div class="detail-rel-item"><span class="detail-rel-type">${esc(r.relation)}</span><span class="detail-rel-path" onclick="selectNode('${esc(r.source_path)}')">${esc(r.source_path)}</span><span class="detail-rel-dir">←</span></div>`;
+		h += `<button class="btn btn-sm" style="margin-top:6px" onclick="showAddRel()">+ Add</button></div>`;
+		if (n.files.length || n.type === 'RECORD') { h += `<div class="detail-section"><div class="detail-section-title">Files (${n.files.length})</div>`; if (n.files.length) { h += '<div class="detail-files-grid">'; for (const f of n.files) { const isI = ['jpg','jpeg','png','gif','webp','bmp'].includes(f.ext), isV = ['mp4','webm','mov'].includes(f.ext); h += `<div class="detail-file" onclick="openFile('${f.hash}','${f.ext}','${esc(f.name)}')"><div class="detail-file-preview">${isI ? `<img src="/api/blob/${f.hash}" loading="lazy">` : isV ? `<video src="/api/blob/${f.hash}" muted></video>` : '<span class="detail-file-icon">📎</span>'}</div><div class="detail-file-info"><div class="detail-file-name" title="${esc(f.name)}">${esc(f.name)}</div><div class="detail-file-size">${formatSize(f.size)}</div></div></div>`; } h += '</div>'; } h += `<button class="btn btn-sm btn-block" style="margin-top:8px" onclick="showUpload()">+ Upload</button></div>`; }
+		h += `<div class="detail-section"><div class="detail-section-title">Actions</div><button class="btn btn-sm btn-danger" onclick="delNode()">Delete</button></div>`;
+		document.getElementById('detailBody').innerHTML = h;
 	}
+	function closeDetailPanel() { document.getElementById('detailPanel').classList.add('hidden'); selectedPath = null; currentNode = null; }
 	
-	function renderDetailPanel(node) {
-		const panel = document.getElementById('detailPanel');
-		panel.classList.remove('hidden');
-		document.getElementById('detailTitle').textContent = node.name;
-		document.getElementById('detailPath').textContent = node.path;
-		
-		let html = '';
-		const meta = node.metadata || {};
-		
-		html += `<div class="detail-section"><div class="detail-section-title">Metadata <button class="btn btn-sm" onclick="showEditMetaModal()">Edit</button></div>
-			${Object.keys(meta).length > 0 ? `<div class="detail-meta-grid">${Object.entries(meta).map(([k,v]) => `
-				<div class="detail-meta-item ${String(v).length > 50 ? 'full' : ''}"><div class="detail-meta-label">${escapeHtml(k)}</div>
-				<div class="detail-meta-value">${escapeHtml(typeof v === 'object' ? JSON.stringify(v) : String(v))}</div></div>`).join('')}</div>` : '<div style="color:var(--text-3);font-size:0.85rem">No metadata</div>'}</div>`;
-		
-		html += `<div class="detail-section"><div class="detail-section-title">Tags</div><div class="detail-tags" id="detailTags">
-			${node.tags.map(t => `<span class="detail-tag">${escapeHtml(t)}<span class="remove" onclick="removeTag('${escapeHtml(t)}')">×</span></span>`).join('')}
-			<button class="btn btn-sm" onclick="showAddTagModal()">+ Add</button></div></div>`;
-		
-		html += `<div class="detail-section"><div class="detail-section-title">Relationships</div>`;
-		for (const rel of node.relationships) {
-			html += `<div class="detail-rel-item"><span class="detail-rel-type">${escapeHtml(rel.relation)}</span>
-				<span class="detail-rel-path" onclick="selectNode('${escapeHtml(rel.target_path)}')">${escapeHtml(rel.target_path)}</span>
-				<span class="detail-rel-dir">→</span><span class="detail-rel-remove" onclick="removeRelationship('${escapeHtml(node.path)}','${escapeHtml(rel.target_path)}','${escapeHtml(rel.relation)}')">×</span></div>`;
-		}
-		for (const rel of node.incoming_relationships) {
-			html += `<div class="detail-rel-item"><span class="detail-rel-type">${escapeHtml(rel.relation)}</span>
-				<span class="detail-rel-path" onclick="selectNode('${escapeHtml(rel.source_path)}')">${escapeHtml(rel.source_path)}</span>
-				<span class="detail-rel-dir">←</span></div>`;
-		}
-		html += `<button class="btn btn-sm" style="margin-top:8px" onclick="showAddRelModal()">+ Add</button></div>`;
-		
-		if (node.files.length > 0 || node.type === 'RECORD') {
-			html += `<div class="detail-section"><div class="detail-section-title">Files (${node.files.length})</div>`;
-			if (node.files.length > 0) {
-				html += `<div class="detail-files-grid">`;
-				for (const f of node.files) {
-					const isImg = ['jpg','jpeg','png','gif','webp','bmp'].includes(f.ext);
-					const isVid = ['mp4','webm','mov'].includes(f.ext);
-					html += `<div class="detail-file" onclick="openFile('${f.hash}','${f.ext}','${escapeHtml(f.name)}')">
-						<div class="detail-file-preview">${isImg ? `<img src="/api/blob/${f.hash}" loading="lazy">` : isVid ? `<video src="/api/blob/${f.hash}" muted></video>` : '<span class="detail-file-icon">📎</span>'}</div>
-						<div class="detail-file-info"><div class="detail-file-name" title="${escapeHtml(f.name)}">${escapeHtml(f.name)}</div><div class="detail-file-size">${formatSize(f.size)}</div></div></div>`;
-				}
-				html += `</div>`;
-			}
-			html += `<button class="btn btn-sm btn-block" style="margin-top:12px" onclick="showUploadModal()">+ Upload</button></div>`;
-		}
-		
-		html += `<div class="detail-section"><div class="detail-section-title">Actions</div><button class="btn btn-sm btn-danger" onclick="deleteNode()">Delete Node</button></div>`;
-		
-		document.getElementById('detailBody').innerHTML = html;
-	}
+	// CRUD
+	function showEditMeta() { if (!currentNode) return; const m = document.createElement('div'); m.className = 'modal-overlay'; m.innerHTML = `<div class="modal modal-lg"><div class="modal-header"><span class="modal-title">Edit Metadata</span><button class="modal-close" onclick="closeModal(this)">&times;</button></div><div class="modal-body"><div class="form-group"><label class="form-label">Path</label><input class="form-input" value="${esc(currentNode.path)}" readonly></div><div class="form-group"><label class="form-label">Metadata (JSON)</label><textarea class="form-textarea" id="editMetaVal" style="min-height:200px">${esc(JSON.stringify(currentNode.metadata||{},null,2))}</textarea></div></div><div class="modal-footer"><button class="btn" onclick="closeModal(this)">Cancel</button><button class="btn btn-primary" onclick="saveMeta()">Save</button></div></div>`; document.body.appendChild(m); }
+	async function saveMeta() { if (!currentNode) return; try { const mt = JSON.parse(document.getElementById('editMetaVal').value); await api('POST', '/api/node/update', { path: currentNode.path, metadata: mt }); toast('Updated', 'success'); closeModal(document.querySelector('.modal-overlay .modal')); selectNode(currentNode.path); } catch (e) { toast(e.message, 'error'); } }
 	
-	function closeDetailPanel() { document.getElementById('detailPanel').classList.add('hidden'); selectedPath = null; currentNodeData = null; }
+	function showAddTag() { const t = prompt('Tag:'); if (t) addTag(t.trim()); }
+	async function addTag(t) { if (!currentNode) return; try { await api('POST', '/api/tag', { path: currentNode.path, tag: t }); toast('Added', 'success'); selectNode(currentNode.path); } catch (e) { toast(e.message, 'error'); } }
+	async function remTag(t) { if (!currentNode) return; try { await api('DELETE', '/api/tag', { path: currentNode.path, tag: t }); toast('Removed', 'success'); selectNode(currentNode.path); } catch (e) { toast(e.message, 'error'); } }
 	
-	// === CRUD Modals ===
-	function showEditMetaModal() {
-		if (!currentNodeData) return;
-		const modal = document.createElement('div');
-		modal.className = 'modal-overlay';
-		modal.innerHTML = `<div class="modal modal-lg"><div class="modal-header"><span class="modal-title">Edit Metadata</span><button class="modal-close" onclick="closeModal(this)">&times;</button></div>
-			<div class="modal-body"><div class="form-group"><label class="form-label">Path</label><input type="text" class="form-input" value="${escapeHtml(currentNodeData.path)}" readonly></div>
-			<div class="form-group"><label class="form-label">Metadata (JSON)</label><textarea class="form-textarea" id="editMetaValue" style="min-height:250px">${escapeHtml(JSON.stringify(currentNodeData.metadata || {}, null, 2))}</textarea></div></div>
-			<div class="modal-footer"><button class="btn" onclick="closeModal(this)">Cancel</button><button class="btn btn-primary" onclick="saveMetadata()">Save</button></div></div>`;
-		document.body.appendChild(modal);
-	}
+	function showAddRel() { const m = document.createElement('div'); m.className = 'modal-overlay'; m.innerHTML = `<div class="modal"><div class="modal-header"><span class="modal-title">Add Relationship</span><button class="modal-close" onclick="closeModal(this)">&times;</button></div><div class="modal-body"><div class="form-group"><label class="form-label">Source</label><input class="form-input" value="${esc(currentNode?.path||'')}" readonly></div><div class="form-group"><label class="form-label">Relation</label><input class="form-input" id="relN"></div><div class="form-group"><label class="form-label">Target Path</label><input class="form-input" id="relT"></div></div><div class="modal-footer"><button class="btn" onclick="closeModal(this)">Cancel</button><button class="btn btn-primary" onclick="addRel()">Add</button></div></div>`; document.body.appendChild(m); }
+	async function addRel() { if (!currentNode) return; const r = document.getElementById('relN').value.trim(), t = document.getElementById('relT').value.trim(); if (!r || !t) { toast('All fields required', 'error'); return; } try { await api('POST', '/api/link', { source: currentNode.path, target: t, relation: r }); toast('Created', 'success'); closeModal(document.querySelector('.modal-overlay .modal')); selectNode(currentNode.path); } catch (e) { toast(e.message, 'error'); } }
+	async function remRel(s, t, r) { try { await api('DELETE', '/api/link', { source: s, target: t, relation: r }); toast('Removed', 'success'); selectNode(s); } catch (e) { toast(e.message, 'error'); } }
 	
-	async function saveMetadata() {
-		if (!currentNodeData) return;
-		try { const metadata = JSON.parse(document.getElementById('editMetaValue').value);
-			await api('POST', '/api/node/update', { path: currentNodeData.path, metadata });
-			toast('Updated', 'success'); closeModal(document.querySelector('.modal-overlay .modal')); selectNode(currentNodeData.path); }
-		catch (e) { toast(e.message, 'error'); }
-	}
+	function showUpload() { const m = document.createElement('div'); m.className = 'modal-overlay'; m.innerHTML = `<div class="modal"><div class="modal-header"><span class="modal-title">Upload</span><button class="modal-close" onclick="closeModal(this)">&times;</button></div><div class="modal-body"><div class="form-group"><label class="form-label">Target</label><input class="form-input" id="upPath" value="${esc(currentNode?.path||'')}" readonly></div><div class="upload-zone" id="upZone" onclick="document.getElementById('upInput').click()"><div style="font-size:1.5rem;margin-bottom:6px">📁</div><div class="upload-zone-text">Drop files or click</div><input type="file" id="upInput" multiple style="display:none" onchange="handleUp()"></div></div></div>`; document.body.appendChild(m); const z = m.querySelector('#upZone'); z.ondragover = e => { e.preventDefault(); z.classList.add('dragover'); }; z.ondragleave = () => z.classList.remove('dragover'); z.ondrop = async e => { e.preventDefault(); z.classList.remove('dragover'); await upFiles(e.dataTransfer.files); }; }
+	async function handleUp() { await upFiles(document.getElementById('upInput').files); }
+	async function upFiles(files) { const p = document.getElementById('upPath').value, fd = new FormData(); fd.append('path', p); for (const f of files) fd.append('file', f, f.name); try { await api('POST', '/api/upload', fd); toast(`Uploaded ${files.length}`, 'success'); closeModal(document.querySelector('.modal-overlay .modal')); selectNode(p); } catch (e) { toast(e.message, 'error'); } }
 	
-	function showAddTagModal() {
-		const modal = document.createElement('div');
-		modal.className = 'modal-overlay';
-		modal.innerHTML = `<div class="modal"><div class="modal-header"><span class="modal-title">Add Tag</span><button class="modal-close" onclick="closeModal(this)">&times;</button></div>
-			<div class="modal-body"><div class="form-group"><label class="form-label">Tag</label><input type="text" class="form-input" id="newTagInput" placeholder="tag_name"></div></div>
-			<div class="modal-footer"><button class="btn" onclick="closeModal(this)">Cancel</button><button class="btn btn-primary" onclick="addTag()">Add</button></div></div>`;
-		document.body.appendChild(modal);
-	}
+	async function delNode() { if (!currentNode) return; if (!confirm(`Delete "${currentNode.path}"?`)) return; try { await api('DELETE', `/api/node/${encodeURIComponent(currentNode.path)}`); toast('Deleted', 'success'); closeDetailPanel(); refreshTree(); executeSearch(); } catch (e) { toast(e.message, 'error'); } }
 	
-	async function addTag() {
-		if (!currentNodeData) return;
-		const tag = document.getElementById('newTagInput').value.trim();
-		if (!tag) { toast('Tag required', 'error'); return; }
-		try { await api('POST', '/api/tag', { path: currentNodeData.path, tag }); toast('Added', 'success'); closeModal(document.querySelector('.modal-overlay .modal')); selectNode(currentNodeData.path); }
-		catch (e) { toast(e.message, 'error'); }
-	}
+	function showCreateModal() { if (!archiveOpen) { toast('Open archive first', 'error'); return; } const m = document.createElement('div'); m.className = 'modal-overlay'; m.innerHTML = `<div class="modal"><div class="modal-header"><span class="modal-title">Create Node</span><button class="modal-close" onclick="closeModal(this)">&times;</button></div><div class="modal-body"><div class="form-group"><label class="form-label">Type</label><select class="form-select" id="crType"><option value="VAULT">Vault</option><option value="RECORD">Record</option></select></div><div class="form-group"><label class="form-label">Path</label><input class="form-input" id="crPath"></div><div class="form-group"><label class="form-label">Metadata (JSON)</label><textarea class="form-textarea" id="crMeta"></textarea></div></div><div class="modal-footer"><button class="btn" onclick="closeModal(this)">Cancel</button><button class="btn btn-primary" onclick="createNode()">Create</button></div></div>`; document.body.appendChild(m); }
+	async function createNode() { const t = document.getElementById('crType').value, p = document.getElementById('crPath').value.trim(); let mt = {}; try { const m = document.getElementById('crMeta').value.trim(); if (m) mt = JSON.parse(m); } catch { toast('Invalid JSON', 'error'); return; } if (!p) { toast('Path required', 'error'); return; } try { await api('POST', t === 'VAULT' ? '/api/vault' : '/api/record', { path: p, metadata: mt }); toast('Created', 'success'); closeModal(document.querySelector('.modal-overlay .modal')); refreshTree(); executeSearch(); } catch (e) { toast(e.message, 'error'); } }
 	
-	async function removeTag(tag) { if (!currentNodeData) return; try { await api('DELETE', '/api/tag', { path: currentNodeData.path, tag }); toast('Removed', 'success'); selectNode(currentNodeData.path); } catch (e) { toast(e.message, 'error'); } }
+	// Extract & Settings
+	async function showExtractorModal() { if (!archiveOpen) { toast('Open archive first', 'error'); return; } let ex = []; try { ex = (await api('GET', '/api/extractors')).extractors; } catch { toast('Failed', 'error'); return; } const m = document.createElement('div'); m.className = 'modal-overlay'; m.innerHTML = `<div class="modal modal-lg"><div class="modal-header"><span class="modal-title">Extract</span><button class="modal-close" onclick="closeModal(this)">&times;</button></div><div class="modal-body"><div class="form-group"><label class="form-label">URL</label><input class="form-input" id="exUrl"><div class="form-hint">Extractors: ${ex.map(e => e.name).join(', ')}</div></div><div class="form-group"><label class="form-label">Cookies</label><textarea class="form-textarea" id="exCk"></textarea></div><div class="form-group"><label class="form-label">Config (JSON)</label><textarea class="form-textarea" id="exCfg"></textarea></div></div><div class="modal-footer"><button class="btn" onclick="closeModal(this)">Cancel</button><button class="btn btn-primary" onclick="runExtract()">Extract</button></div></div>`; document.body.appendChild(m); }
+	async function runExtract() { const u = document.getElementById('exUrl').value.trim(), ck = document.getElementById('exCk').value; let cfg = {}; try { const c = document.getElementById('exCfg').value.trim(); if (c) cfg = JSON.parse(c); } catch { toast('Invalid JSON', 'error'); return; } if (!u) { toast('URL required', 'error'); return; } try { toast('Extracting...', 'info'); closeModal(document.querySelector('.modal-overlay .modal')); await api('POST', '/api/extract', { url: u, cookies: ck, config: cfg }); toast('Done', 'success'); refreshTree(); executeSearch(); } catch (e) { toast(e.message, 'error'); } }
 	
-	function showAddRelModal() {
-		const modal = document.createElement('div');
-		modal.className = 'modal-overlay';
-		modal.innerHTML = `<div class="modal"><div class="modal-header"><span class="modal-title">Add Relationship</span><button class="modal-close" onclick="closeModal(this)">&times;</button></div>
-			<div class="modal-body"><div class="form-group"><label class="form-label">Source</label><input type="text" class="form-input" value="${escapeHtml(currentNodeData?.path || '')}" readonly></div>
-			<div class="form-group"><label class="form-label">Relation</label><input type="text" class="form-input" id="relName" placeholder="RELATED_TO"></div>
-			<div class="form-group"><label class="form-label">Target Path</label><input type="text" class="form-input" id="relTarget" placeholder="path/to/target"></div></div>
-			<div class="modal-footer"><button class="btn" onclick="closeModal(this)">Cancel</button><button class="btn btn-primary" onclick="addRelationship()">Add</button></div></div>`;
-		document.body.appendChild(modal);
-	}
+	async function showSettingsModal() { if (!archiveOpen) { showOpenArchiveModal(); return; } let cfg; try { cfg = await api('GET', '/api/config'); } catch { toast('Failed', 'error'); return; } const m = document.createElement('div'); m.className = 'modal-overlay'; m.innerHTML = `<div class="modal"><div class="modal-header"><span class="modal-title">Settings</span><button class="modal-close" onclick="closeModal(this)">&times;</button></div><div class="modal-body"><div class="tabs"><div class="tab active" data-t="general" onclick="swTab('general')">General</div><div class="tab" data-t="enc" onclick="swTab('enc')">Encryption</div><div class="tab" data-t="act" onclick="swTab('act')">Actions</div></div><div class="tab-content active" id="tabGeneral" style="padding-top:14px"><div class="form-group"><label class="form-label">Path</label><input class="form-input" value="${esc(cfg.path)}" readonly></div><div class="form-group"><label class="form-label">Partition</label><select class="form-select" id="setPart"><option value="0" ${cfg.partition_size===0?'selected':''}>Disabled</option><option value="26214400" ${cfg.partition_size===26214400?'selected':''}>25MB</option><option value="52428800" ${cfg.partition_size===52428800?'selected':''}>50MB</option><option value="104857600" ${cfg.partition_size===104857600?'selected':''}>100MB</option></select><button class="btn btn-sm" style="margin-top:6px" onclick="updPart()">Update</button></div></div><div class="tab-content" id="tabEnc" style="padding-top:14px"><p style="margin-bottom:12px;color:var(--text-2)">Status: ${cfg.encrypted ? '<span style="color:var(--success)">Enabled</span>' : 'Disabled'}</p>${cfg.encrypted ? `<div class="form-group"><label class="form-label">Current Password</label><input type="password" class="form-input" id="encOld"></div><div class="form-group"><label class="form-label">New (empty to disable)</label><input type="password" class="form-input" id="encNew"></div><button class="btn" onclick="updEnc()">Update</button>` : `<div class="form-group"><label class="form-label">Password</label><input type="password" class="form-input" id="encNew"></div><button class="btn" onclick="enableEnc()">Enable</button>`}</div><div class="tab-content" id="tabAct" style="padding-top:14px"><div class="form-group"><button class="btn btn-block" onclick="genStatic()">Generate Static Site</button></div><div class="form-group"><button class="btn btn-block" onclick="closeArch()">Close Archive</button></div></div></div></div>`; document.body.appendChild(m); }
+	function swTab(t) { document.querySelectorAll('.modal .tab').forEach(e => e.classList.toggle('active', e.dataset.t === t)); document.querySelectorAll('.modal .tab-content').forEach(c => c.classList.remove('active')); document.getElementById('tab' + t.charAt(0).toUpperCase() + t.slice(1)).classList.add('active'); }
+	async function updPart() { try { await api('POST', '/api/config/partition', { size: parseInt(document.getElementById('setPart').value) }); toast('Updated', 'success'); } catch (e) { toast(e.message, 'error'); } }
+	async function enableEnc() { const p = document.getElementById('encNew').value; if (!p) { toast('Password required', 'error'); return; } try { await api('POST', '/api/config/encryption', { action: 'enable', password: p }); toast('Enabled', 'success'); closeModal(document.querySelector('.modal-overlay .modal')); checkStatus(); } catch (e) { toast(e.message, 'error'); } }
+	async function updEnc() { const o = document.getElementById('encOld').value, n = document.getElementById('encNew').value; if (!o) { toast('Current password required', 'error'); return; } try { if (n) { await api('POST', '/api/config/encryption', { action: 'change_password', old_password: o, new_password: n }); toast('Changed', 'success'); } else { await api('POST', '/api/config/encryption', { action: 'disable', password: o }); toast('Disabled', 'success'); } closeModal(document.querySelector('.modal-overlay .modal')); checkStatus(); } catch (e) { toast(e.message, 'error'); } }
+	async function genStatic() { try { await api('POST', '/api/generate-static'); toast('Generated', 'success'); } catch (e) { toast(e.message, 'error'); } }
+	async function closeArch() { await api('POST', '/api/archive/close'); closeModal(document.querySelector('.modal-overlay .modal')); checkStatus(); }
 	
-	async function addRelationship() {
-		if (!currentNodeData) return;
-		const relation = document.getElementById('relName').value.trim();
-		const target = document.getElementById('relTarget').value.trim();
-		if (!relation || !target) { toast('All fields required', 'error'); return; }
-		try { await api('POST', '/api/link', { source: currentNodeData.path, target, relation }); toast('Created', 'success'); closeModal(document.querySelector('.modal-overlay .modal')); selectNode(currentNodeData.path); }
-		catch (e) { toast(e.message, 'error'); }
-	}
-	
-	async function removeRelationship(source, target, relation) { try { await api('DELETE', '/api/link', { source, target, relation }); toast('Removed', 'success'); selectNode(source); } catch (e) { toast(e.message, 'error'); } }
-	
-	function showUploadModal() {
-		const modal = document.createElement('div');
-		modal.className = 'modal-overlay';
-		modal.innerHTML = `<div class="modal"><div class="modal-header"><span class="modal-title">Upload Files</span><button class="modal-close" onclick="closeModal(this)">&times;</button></div>
-			<div class="modal-body"><div class="form-group"><label class="form-label">Target</label><input type="text" class="form-input" id="uploadTargetPath" value="${escapeHtml(currentNodeData?.path || '')}" readonly></div>
-			<div class="upload-zone" id="uploadZone" onclick="document.getElementById('uploadInput').click()"><div style="font-size:2rem;margin-bottom:8px">📁</div><div class="upload-zone-text">Drop files or click</div>
-			<input type="file" id="uploadInput" multiple style="display:none" onchange="handleUpload()"></div></div></div>`;
-		document.body.appendChild(modal);
-		const zone = modal.querySelector('#uploadZone');
-		zone.ondragover = e => { e.preventDefault(); zone.classList.add('dragover'); };
-		zone.ondragleave = () => zone.classList.remove('dragover');
-		zone.ondrop = async e => { e.preventDefault(); zone.classList.remove('dragover'); await uploadFiles(e.dataTransfer.files); };
-	}
-	
-	async function handleUpload() { await uploadFiles(document.getElementById('uploadInput').files); }
-	async function uploadFiles(files) {
-		const path = document.getElementById('uploadTargetPath').value;
-		const fd = new FormData();
-		fd.append('path', path);
-		for (const f of files) fd.append('file', f, f.name);
-		try { await api('POST', '/api/upload', fd); toast(`Uploaded ${files.length}`, 'success'); closeModal(document.querySelector('.modal-overlay .modal')); selectNode(path); }
-		catch (e) { toast(e.message, 'error'); }
-	}
-	
-	async function deleteNode() {
-		if (!currentNodeData) return;
-		if (!confirm(`Delete "${currentNodeData.path}"?`)) return;
-		try { await api('DELETE', `/api/node/${encodeURIComponent(currentNodeData.path)}`); toast('Deleted', 'success'); closeDetailPanel(); refreshTree(); executeSearch(); }
-		catch (e) { toast(e.message, 'error'); }
-	}
-	
-	function showCreateModal() {
-		if (!archiveOpen) { toast('Open archive first', 'error'); return; }
-		const modal = document.createElement('div');
-		modal.className = 'modal-overlay';
-		modal.innerHTML = `<div class="modal"><div class="modal-header"><span class="modal-title">Create Node</span><button class="modal-close" onclick="closeModal(this)">&times;</button></div>
-			<div class="modal-body"><div class="form-group"><label class="form-label">Type</label><select class="form-select" id="createNodeType"><option value="VAULT">Vault</option><option value="RECORD">Record</option></select></div>
-			<div class="form-group"><label class="form-label">Path</label><input type="text" class="form-input" id="createNodePath" placeholder="parent/name"></div>
-			<div class="form-group"><label class="form-label">Metadata (JSON)</label><textarea class="form-textarea" id="createNodeMeta" placeholder='{"key":"value"}'></textarea></div></div>
-			<div class="modal-footer"><button class="btn" onclick="closeModal(this)">Cancel</button><button class="btn btn-primary" onclick="createNode()">Create</button></div></div>`;
-		document.body.appendChild(modal);
-	}
-	
-	async function createNode() {
-		const type = document.getElementById('createNodeType').value;
-		const path = document.getElementById('createNodePath').value.trim();
-		let metadata = {};
-		try { const m = document.getElementById('createNodeMeta').value.trim(); if (m) metadata = JSON.parse(m); } catch { toast('Invalid JSON', 'error'); return; }
-		if (!path) { toast('Path required', 'error'); return; }
-		try { await api('POST', type === 'VAULT' ? '/api/vault' : '/api/record', { path, metadata }); toast('Created', 'success'); closeModal(document.querySelector('.modal-overlay .modal')); refreshTree(); executeSearch(); }
-		catch (e) { toast(e.message, 'error'); }
-	}
-	
-	// === Extractor & Settings ===
-	async function showExtractorModal() {
-		if (!archiveOpen) { toast('Open archive first', 'error'); return; }
-		let extractors = [];
-		try { extractors = (await api('GET', '/api/extractors')).extractors; } catch { toast('Failed to load extractors', 'error'); return; }
-		const modal = document.createElement('div');
-		modal.className = 'modal-overlay';
-		modal.innerHTML = `<div class="modal modal-lg"><div class="modal-header"><span class="modal-title">Extract</span><button class="modal-close" onclick="closeModal(this)">&times;</button></div>
-			<div class="modal-body"><div class="form-group"><label class="form-label">URL</label><input type="text" class="form-input" id="extractUrl" placeholder="https://...">
-			<div class="form-hint">Extractors: ${extractors.map(e => e.name).join(', ')}</div></div>
-			<div class="form-group"><label class="form-label">Cookies</label><textarea class="form-textarea" id="extractCookies" placeholder="Netscape format..."></textarea></div>
-			<div class="form-group"><label class="form-label">Config (JSON)</label><textarea class="form-textarea" id="extractConfig" placeholder='{"password":"..."}'></textarea></div></div>
-			<div class="modal-footer"><button class="btn" onclick="closeModal(this)">Cancel</button><button class="btn btn-primary" onclick="runExtractor()">Extract</button></div></div>`;
-		document.body.appendChild(modal);
-	}
-	
-	async function runExtractor() {
-		const url = document.getElementById('extractUrl').value.trim();
-		const cookies = document.getElementById('extractCookies').value;
-		let config = {};
-		try { const c = document.getElementById('extractConfig').value.trim(); if (c) config = JSON.parse(c); } catch { toast('Invalid JSON', 'error'); return; }
-		if (!url) { toast('URL required', 'error'); return; }
-		try { toast('Extracting...', 'info'); closeModal(document.querySelector('.modal-overlay .modal'));
-			await api('POST', '/api/extract', { url, cookies, config }); toast('Done', 'success'); refreshTree(); executeSearch(); }
-		catch (e) { toast(e.message, 'error'); }
-	}
-	
-	async function showSettingsModal() {
-		if (!archiveOpen) { showOpenArchiveModal(); return; }
-		let config; try { config = await api('GET', '/api/config'); } catch { toast('Failed', 'error'); return; }
-		const modal = document.createElement('div');
-		modal.className = 'modal-overlay';
-		modal.innerHTML = `<div class="modal"><div class="modal-header"><span class="modal-title">Settings</span><button class="modal-close" onclick="closeModal(this)">&times;</button></div>
-			<div class="modal-body"><div class="tabs"><div class="tab active" data-tab="general" onclick="switchTab('general')">General</div><div class="tab" data-tab="encryption" onclick="switchTab('encryption')">Encryption</div><div class="tab" data-tab="actions" onclick="switchTab('actions')">Actions</div></div>
-			<div class="tab-content active" id="tabGeneral" style="padding-top:16px">
-				<div class="form-group"><label class="form-label">Path</label><input class="form-input" value="${escapeHtml(config.path)}" readonly></div>
-				<div class="form-group"><label class="form-label">Partition Size</label><select class="form-select" id="settingsPartition">
-					<option value="0" ${config.partition_size===0?'selected':''}>Disabled</option><option value="26214400" ${config.partition_size===26214400?'selected':''}>25 MB</option>
-					<option value="52428800" ${config.partition_size===52428800?'selected':''}>50 MB</option><option value="104857600" ${config.partition_size===104857600?'selected':''}>100 MB</option>
-				</select><button class="btn btn-sm" style="margin-top:8px" onclick="updatePartition()">Update</button></div></div>
-			<div class="tab-content" id="tabEncryption" style="padding-top:16px">
-				<p style="margin-bottom:16px;color:var(--text-2)">Status: ${config.encrypted ? '<span style="color:var(--success)">Enabled</span>' : 'Disabled'}</p>
-				${config.encrypted ? `<div class="form-group"><label class="form-label">Current Password</label><input type="password" class="form-input" id="encOldPass"></div>
-					<div class="form-group"><label class="form-label">New Password (empty to disable)</label><input type="password" class="form-input" id="encNewPass"></div>
-					<button class="btn" onclick="updateEncryption()">Update</button>`
-				: `<div class="form-group"><label class="form-label">Password</label><input type="password" class="form-input" id="encNewPass"></div><button class="btn" onclick="enableEncryption()">Enable</button>`}</div>
-			<div class="tab-content" id="tabActions" style="padding-top:16px">
-				<div class="form-group"><button class="btn btn-block" onclick="generateStatic()">Generate Static Site</button></div>
-				<div class="form-group"><button class="btn btn-block" onclick="closeArchiveAction()">Close Archive</button></div></div></div></div>`;
-		document.body.appendChild(modal);
-	}
-	
-	function switchTab(tab) { document.querySelectorAll('.modal .tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab)); document.querySelectorAll('.modal .tab-content').forEach(c => c.classList.remove('active')); document.getElementById('tab' + tab.charAt(0).toUpperCase() + tab.slice(1)).classList.add('active'); }
-	async function updatePartition() { try { await api('POST', '/api/config/partition', { size: parseInt(document.getElementById('settingsPartition').value) }); toast('Updated', 'success'); } catch (e) { toast(e.message, 'error'); } }
-	async function enableEncryption() { const p = document.getElementById('encNewPass').value; if (!p) { toast('Password required', 'error'); return; } try { await api('POST', '/api/config/encryption', { action: 'enable', password: p }); toast('Enabled', 'success'); closeModal(document.querySelector('.modal-overlay .modal')); checkStatus(); } catch (e) { toast(e.message, 'error'); } }
-	async function updateEncryption() { const o = document.getElementById('encOldPass').value, n = document.getElementById('encNewPass').value; if (!o) { toast('Current password required', 'error'); return; } try { if (n) { await api('POST', '/api/config/encryption', { action: 'change_password', old_password: o, new_password: n }); toast('Changed', 'success'); } else { await api('POST', '/api/config/encryption', { action: 'disable', password: o }); toast('Disabled', 'success'); } closeModal(document.querySelector('.modal-overlay .modal')); checkStatus(); } catch (e) { toast(e.message, 'error'); } }
-	async function generateStatic() { try { await api('POST', '/api/generate-static'); toast('Generated', 'success'); } catch (e) { toast(e.message, 'error'); } }
-	async function closeArchiveAction() { await api('POST', '/api/archive/close'); closeModal(document.querySelector('.modal-overlay .modal')); checkStatus(); }
-	
-	// === Lightbox ===
-	function openFile(hash, ext, name) {
-		const isImg = ['jpg','jpeg','png','gif','webp','bmp'].includes(ext);
-		const isVid = ['mp4','webm','mov'].includes(ext);
-		if (isImg) { document.getElementById('lightboxContent').innerHTML = `<img src="/api/blob/${hash}">`; document.getElementById('lightbox').classList.remove('hidden'); }
-		else if (isVid) { document.getElementById('lightboxContent').innerHTML = `<video src="/api/blob/${hash}" controls autoplay></video>`; document.getElementById('lightbox').classList.remove('hidden'); }
-		else { const a = document.createElement('a'); a.href = `/api/blob/${hash}`; a.download = name; a.click(); }
-	}
+	// Lightbox
+	function openFile(h, e, n) { const isI = ['jpg','jpeg','png','gif','webp','bmp'].includes(e), isV = ['mp4','webm','mov'].includes(e); if (isI) { document.getElementById('lightboxContent').innerHTML = `<img src="/api/blob/${h}">`; document.getElementById('lightbox').classList.remove('hidden'); } else if (isV) { document.getElementById('lightboxContent').innerHTML = `<video src="/api/blob/${h}" controls autoplay></video>`; document.getElementById('lightbox').classList.remove('hidden'); } else { const a = document.createElement('a'); a.href = `/api/blob/${h}`; a.download = n; a.click(); } }
 	function closeLightbox(e) { if (!e || e.target.id === 'lightbox' || e.target.classList.contains('lightbox-close')) { document.getElementById('lightbox').classList.add('hidden'); document.getElementById('lightboxContent').innerHTML = ''; } }
 	
 	document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeLightbox(); document.querySelector('.modal-overlay')?.remove(); } });
-	
 	checkStatus();
 	</script>
 </body>
