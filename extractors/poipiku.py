@@ -98,44 +98,9 @@ class PoipikuExtractor(BaseExtractor):
 			"post_id": post_id
 		}
 
-		# 2. Resolve Images (Handle Passwords)
-		image_urls = self._resolve_images(user_id, post_id, config)
-		
-		if not image_urls:
-			logger.warning(f"[{self.name}] No images found for {post_id}. Skipping (Auth failed or text-only).")
-			return
+		yield from self._resolve_images(user_id, post_id, config, metadata)
 
-		# 3. Create File Streams
-		for idx, img_url in enumerate(image_urls):
-			try:
-				# Deduce extension from URL
-				path_part = img_url.split("?")[0]
-				ext = "." + path_part.split(".")[-1]
-				filename = f"{user_id}_{post_id}_{idx}{ext}"
-				
-				# Request stream
-				img_resp = self._request("GET", img_url, stream=True)
-				img_resp.raw.decode_content = True
-				
-				yield DiscoveredNode(
-					suggested_path=f"poipiku/users/{user_id}/{post_id}",
-					node_type="RECORD",
-					metadata=metadata,
-					files=[DiscoveredFile(
-						original_name=filename,
-						source_url=img_url,
-						stream=img_resp.raw
-					)],
-					tags=tags,
-					relationships=[
-						("AUTHORED_BY", f"poipiku/users/{user_id}")
-					]
-				)
-			except Exception as e:
-				logger.error(f"[{self.name}] Error streaming image {img_url}: {e}")
-
-
-	def _resolve_images(self, user_id: str, post_id: str, config: dict) -> List[str]:
+	def _resolve_images(self, user_id: str, post_id: str, config: dict, metadata: dict = {}) -> Generator[DiscoveredFile, None, None]:
 		"""
 		Tries passwords against the AJAX endpoint to get image URLs.
 		"""
@@ -169,13 +134,35 @@ class PoipikuExtractor(BaseExtractor):
 				# API Result: 1 = Success
 				if json_data.get("result") == 1:
 					html_content = json_data.get("html", "")
-					images = self.CDN_PATTERN.findall(html_content)
+					images: list[str] = self.CDN_PATTERN.findall(html_content)
 					if images:
 						if pwd:
 							logger.info(f"[{self.name}] Unlocked {post_id} with password.")
-						return list(set(images)) # Deduplicate
+						
+						for idx, img_url in enumerate(images):
+							try:
+								# Deduce extension from URL
+								path_part = img_url.split("?")[0]
+								ext = "." + path_part.split(".")[-1]
+								filename = f"{user_id}_{post_id}_{idx}{ext}"
+								
+								img_resp = self._request("GET", img_url, stream=True)
+								img_resp.raw.decode_content = True
+								
+								yield DiscoveredNode(
+									suggested_path=f"poipiku/users/{user_id}/{post_id}_{idx}",
+									node_type="RECORD",
+									metadata=(metadata | {"image_num": idx} | ({"password_used": pwd} if pwd else metadata)),
+									files=[DiscoveredFile(
+										original_name=filename,
+										source_url=img_url,
+										stream=img_resp.raw
+									)]
+								)
+							except Exception as e:
+								logger.error(f"[{self.name}] Error streaming image {img_url}: {e}")
+								raise e
+					else:
+						logger.error(f"[{self.name}] Failed to resolve images for {post_id}. Result: {json_data} . Exhausted password list.")
 			except Exception as e:
 				logger.debug(f"[{self.name}] Password check failed for {post_id}: {e}")
-		
-		logger.error(f"[{self.name}] Failed to resolve images for {post_id}. Exhausted password list.")
-		return []
