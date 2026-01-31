@@ -43,7 +43,7 @@ class PoipikuExtractor(BaseExtractor):
 			"page_start": 0,            # Start scraping from specific page index
 			
 			# Throttling
-			"sleep_interval": 1.0,      # Seconds to wait between requests to avoid bans
+			"sleep_interval": 0.0,      # Seconds to wait between requests to avoid bans
 			
 			# Cookie / View Preferences
 			"contents_view_mode": "1",  # '1' usually shows all contents
