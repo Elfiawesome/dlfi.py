@@ -1,0 +1,119 @@
+{% extends "base.html" %}
+
+{% block title %}DLFI - {{ vault_name }}{% endblock %}
+
+{% block header_left %}
+<div class="vault-indicator">
+	<div class="dot {{ 'encrypted' if encrypted else '' }}"></div>
+	<span>{{ vault_name }}</span>
+</div>
+{% endblock %}
+
+{% block header_right %}
+<button class="btn btn-sm btn-secondary" onclick="App.exportStatic()">Export</button>
+<a href="/close" class="btn btn-sm btn-secondary">Close Vault</a>
+{% endblock %}
+
+{% block content %}
+<aside class="sidebar">
+	<div class="sidebar-header">
+		<span class="sidebar-title">Structure</span>
+		<div class="sidebar-actions">
+			<button class="btn btn-sm btn-secondary" onclick="App.showCreateNode('VAULT')" title="New Vault">📁+</button>
+			<button class="btn btn-sm btn-secondary" onclick="App.showCreateNode('RECORD')" title="New Record">📄+</button>
+		</div>
+	</div>
+	<div class="sidebar-body">
+		<div class="tree" id="treeView">
+			<div class="loading">
+				<div class="spinner"></div>
+			</div>
+		</div>
+	</div>
+</aside>
+
+<section class="content">
+	<div id="contentHeader" class="content-header hidden">
+		<div class="breadcrumb" id="breadcrumb"></div>
+		<h2 class="content-title" id="contentTitle"></h2>
+		<div class="content-toolbar">
+			<button class="btn btn-sm btn-secondary" onclick="App.showEditMetadata()">Edit Metadata</button>
+			<button class="btn btn-sm btn-danger" onclick="App.deleteNode()">Delete</button>
+		</div>
+	</div>
+	<div class="content-body" id="contentBody">
+		<div class="empty-message">
+			<div class="empty-icon">📂</div>
+			<div class="empty-title">Select an item</div>
+			<div class="empty-text">Choose a vault or record from the sidebar to view its details.</div>
+		</div>
+	</div>
+</section>
+
+<!-- Lightbox -->
+<div id="lightbox" class="lightbox hidden">
+	<button class="lightbox-close" id="lightboxClose">&times;</button>
+	<div class="lightbox-content" id="lightboxContent"></div>
+</div>
+{% endblock %}
+
+{% block modals %}
+<!-- Create Node Modal -->
+<div id="createNodeModal" class="modal-overlay hidden">
+	<div class="modal">
+		<div class="modal-header">
+			<h2 class="modal-title">Create Node</h2>
+		</div>
+		<div class="modal-body">
+			<div class="form-group">
+				<label class="form-label">Type</label>
+				<select id="createNodeType" class="form-input">
+					<option value="VAULT">Vault (Folder)</option>
+					<option value="RECORD">Record (Item)</option>
+				</select>
+			</div>
+			<div class="form-group">
+				<label class="form-label">Path</label>
+				<input type="text" id="createNodePath" class="form-input" placeholder="path/to/node">
+				<p class="form-hint">Full path including parent folders (will be created if needed)</p>
+			</div>
+		</div>
+		<div class="modal-footer">
+			<button class="btn btn-secondary" onclick="document.getElementById('createNodeModal').classList.add('hidden')">Cancel</button>
+			<button class="btn btn-primary" onclick="App.createNode()">Create</button>
+		</div>
+	</div>
+</div>
+
+<!-- Add Tag Modal -->
+<div id="addTagModal" class="modal-overlay hidden">
+	<div class="modal">
+		<div class="modal-header">
+			<h2 class="modal-title">Add Tag</h2>
+		</div>
+		<div class="modal-body">
+			<div class="form-group">
+				<label class="form-label">Tag</label>
+				<input type="text" id="newTagInput" class="form-input" placeholder="Enter tag">
+			</div>
+		</div>
+		<div class="modal-footer">
+			<button class="btn btn-secondary" onclick="document.getElementById('addTagModal').classList.add('hidden')">Cancel</button>
+			<button class="btn btn-primary" onclick="App.addTag()">Add</button>
+		</div>
+	</div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// Enter key handler for tag input
+document.getElementById('newTagInput')?.addEventListener('keypress', (e) => {
+	if (e.key === 'Enter') App.addTag();
+});
+
+document.getElementById('createNodePath')?.addEventListener('keypress', (e) => {
+	if (e.key === 'Enter') App.createNode();
+});
+</script>
+{% endblock %}

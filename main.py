@@ -1,7 +1,6 @@
 import argparse
 import logging
 from dlfi.logger import setup_logging
-from dlfi.server import DLFIServer
 
 
 def main():
@@ -9,19 +8,24 @@ def main():
 	parser.add_argument("--host", default="127.0.0.1", help="Server host (default: 127.0.0.1)")
 	parser.add_argument("--port", "-p", type=int, default=8080, help="Server port (default: 8080)")
 	parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+	parser.add_argument("--vaults-dir", "-d", default=".vaults", help="Default directory for vaults (default: .vaults)")
 	
 	args = parser.parse_args()
 	
 	setup_logging(level=logging.DEBUG if args.debug else logging.INFO)
 	
-	server = DLFIServer(host=args.host, port=args.port)
+	from pathlib import Path
+	from dlfi_server import run_server
+	from dlfi_server.config import ServerConfig
 	
-	try:
-		server.start(blocking=True)
-	except KeyboardInterrupt:
-		logging.info("Shutting down...")
-	finally:
-		server.stop()
+	config = ServerConfig(
+		host=args.host,
+		port=args.port,
+		debug=args.debug,
+		default_vaults_dir=Path(args.vaults_dir).resolve()
+	)
+	
+	run_server(config)
 
 
 if __name__ == "__main__":

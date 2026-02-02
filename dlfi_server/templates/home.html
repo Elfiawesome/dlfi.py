@@ -1,0 +1,474 @@
+{% extends "base.html" %}
+
+{% block title %}DLFI - Select Vault{% endblock %}
+
+{% block content %}
+<div class="home-container">
+	<div class="home-content">
+		<h1 class="home-title">DLFI Vault Manager</h1>
+		<p class="home-subtitle">Select an existing vault or create a new one</p>
+		
+		<div id="alertContainer"></div>
+		
+		<!-- Vaults in default directory -->
+		<div class="section">
+			<div class="section-title">Vaults in {{ default_dir }}</div>
+			{% if default_vaults %}
+			<div class="vault-list">
+				{% for vault in default_vaults %}
+				<div class="vault-item" onclick="openVault('{{ vault.path }}', {{ 'true' if vault.encrypted else 'false' }})">
+					<div class="vault-item-left">
+						<div class="vault-item-icon">📁</div>
+						<div>
+							<div class="vault-item-name">{{ vault.name }}</div>
+						</div>
+					</div>
+					{% if vault.encrypted %}
+					<span class="vault-item-badge">Encrypted</span>
+					{% endif %}
+				</div>
+				{% endfor %}
+			</div>
+			{% else %}
+			<div class="vault-list">
+				<div class="empty-state">
+					<p>No vaults found in default directory</p>
+				</div>
+			</div>
+			{% endif %}
+		</div>
+		
+		<!-- Recent vaults from other locations -->
+		{% if recent_vaults %}
+		<div class="section">
+			<div class="section-title">Recent Vaults (Other Locations)</div>
+			<div class="vault-list">
+				{% for vault in recent_vaults %}
+				<div class="vault-item" onclick="openVault('{{ vault.path }}', {{ 'true' if vault.encrypted else 'false' }})">
+					<div class="vault-item-left">
+						<div class="vault-item-icon">📁</div>
+						<div>
+							<div class="vault-item-name">{{ vault.name }}</div>
+							<div class="vault-item-path">{{ vault.path }}</div>
+						</div>
+					</div>
+					{% if vault.encrypted %}
+					<span class="vault-item-badge">Encrypted</span>
+					{% endif %}
+				</div>
+				{% endfor %}
+			</div>
+		</div>
+		{% endif %}
+		
+		<!-- Open from path -->
+		<div class="section">
+			<div class="section-title">Open Vault from Path</div>
+			<div class="panel">
+				<div class="panel-body">
+					<div class="form-group">
+						<label class="form-label" for="openVaultPath">Vault Path</label>
+						<div class="input-with-button">
+							<input type="text" id="openVaultPath" class="form-input" placeholder="C:\path\to\vault or /home/user/vault">
+							<button class="btn btn-secondary" onclick="showBrowser('open')">Browse</button>
+						</div>
+					</div>
+					<div class="form-group">
+						<label class="form-label" for="openVaultPassword">Password (if encrypted)</label>
+						<input type="password" id="openVaultPassword" class="form-input" placeholder="Leave empty if not encrypted">
+					</div>
+					<div class="form-actions">
+						<button class="btn btn-primary btn-block" onclick="openVaultFromPath()">Open Vault</button>
+					</div>
+				</div>
+			</div>
+		</div>
+		
+		<!-- Create new vault -->
+		<div class="section">
+			<div class="section-title">Create New Vault</div>
+			<div class="panel">
+				<div class="panel-body">
+					<div class="form-group">
+						<div class="radio-group">
+							<label class="radio-label">
+								<input type="radio" name="createLocation" value="default" checked onchange="toggleCreateMode()">
+								<span>In default directory</span>
+							</label>
+							<label class="radio-label">
+								<input type="radio" name="createLocation" value="custom" onchange="toggleCreateMode()">
+								<span>Custom path</span>
+							</label>
+						</div>
+					</div>
+					
+					<div id="createDefaultMode">
+						<div class="form-group">
+							<label class="form-label" for="newVaultName">Vault Name</label>
+							<input type="text" id="newVaultName" class="form-input" placeholder="my-vault">
+						</div>
+					</div>
+					
+					<div id="createCustomMode" class="hidden">
+						<div class="form-group">
+							<label class="form-label" for="newVaultPath">Full Path</label>
+							<div class="input-with-button">
+								<input type="text" id="newVaultPath" class="form-input" placeholder="C:\path\to\new-vault">
+								<button class="btn btn-secondary" onclick="showBrowser('create')">Browse</button>
+							</div>
+						</div>
+					</div>
+					
+					<div class="form-group">
+						<label class="form-label" for="newVaultPassword">Password (optional)</label>
+						<input type="password" id="newVaultPassword" class="form-input" placeholder="Leave empty for unencrypted">
+						<p class="form-hint">If set, the vault will be encrypted with this password.</p>
+					</div>
+					<div class="form-actions">
+						<button class="btn btn-primary btn-block" onclick="createVault()">Create Vault</button>
+					</div>
+				</div>
+			</div>
+		</div>
+	</div>
+</div>
+
+<!-- Password Modal -->
+<div id="passwordModal" class="modal-overlay hidden">
+	<div class="modal">
+		<div class="modal-header">
+			<h2 class="modal-title">Enter Password</h2>
+		</div>
+		<div class="modal-body">
+			<p class="text-secondary mb-4">This vault is encrypted. Enter the password to open it.</p>
+			<div class="form-group">
+				<label class="form-label" for="vaultPassword">Password</label>
+				<input type="password" id="vaultPassword" class="form-input" placeholder="Enter password">
+			</div>
+			<div id="passwordError" class="alert alert-error hidden"></div>
+		</div>
+		<div class="modal-footer">
+			<button class="btn btn-secondary" onclick="closePasswordModal()">Cancel</button>
+			<button class="btn btn-primary" onclick="submitPassword()">Unlock</button>
+		</div>
+	</div>
+</div>
+
+<!-- File Browser Modal -->
+<div id="browserModal" class="modal-overlay hidden">
+	<div class="modal modal-lg">
+		<div class="modal-header">
+			<h2 class="modal-title">Browse Filesystem</h2>
+		</div>
+		<div class="modal-body">
+			<div class="browser-path">
+				<input type="text" id="browserCurrentPath" class="form-input" placeholder="Path">
+				<button class="btn btn-secondary" onclick="navigateTo(document.getElementById('browserCurrentPath').value)">Go</button>
+			</div>
+			<div class="browser-list" id="browserList">
+				<div class="loading"><div class="spinner"></div></div>
+			</div>
+		</div>
+		<div class="modal-footer">
+			<button class="btn btn-secondary" onclick="closeBrowserModal()">Cancel</button>
+			<button class="btn btn-primary" onclick="selectBrowserPath()">Select</button>
+		</div>
+	</div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<style>
+.vault-item-path {
+	font-size: 11px;
+	color: var(--text-muted);
+	font-family: var(--font-mono);
+	margin-top: 2px;
+}
+
+.input-with-button {
+	display: flex;
+	gap: 8px;
+}
+
+.input-with-button .form-input {
+	flex: 1;
+}
+
+.radio-group {
+	display: flex;
+	gap: 24px;
+}
+
+.radio-label {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	cursor: pointer;
+	font-size: 13px;
+}
+
+.radio-label input[type="radio"] {
+	accent-color: var(--accent);
+}
+
+.modal-lg {
+	max-width: 600px;
+}
+
+.browser-path {
+	display: flex;
+	gap: 8px;
+	margin-bottom: 12px;
+}
+
+.browser-path .form-input {
+	flex: 1;
+	font-family: var(--font-mono);
+	font-size: 12px;
+}
+
+.browser-list {
+	max-height: 400px;
+	overflow-y: auto;
+	border: 1px solid var(--border);
+	background: var(--bg-tertiary);
+}
+
+.browser-item {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	padding: 10px 12px;
+	cursor: pointer;
+	border-bottom: 1px solid var(--border);
+	font-size: 13px;
+}
+
+.browser-item:last-child {
+	border-bottom: none;
+}
+
+.browser-item:hover {
+	background: var(--bg-hover);
+}
+
+.browser-item.vault {
+	background: rgba(59, 130, 246, 0.1);
+}
+
+.browser-item-icon {
+	font-size: 16px;
+}
+
+.browser-item-name {
+	flex: 1;
+}
+
+.browser-item-badge {
+	font-size: 10px;
+	padding: 2px 6px;
+	background: var(--accent);
+	color: white;
+}
+</style>
+
+<script>
+let pendingVaultPath = null;
+let browserMode = null; // 'open' or 'create'
+let browserCurrentPath = '';
+
+function showAlert(message, type = 'error') {
+	const container = document.getElementById('alertContainer');
+	container.innerHTML = `<div class="alert alert-${type}">${message}</div>`;
+	setTimeout(() => container.innerHTML = '', 5000);
+}
+
+function toggleCreateMode() {
+	const useDefault = document.querySelector('input[name="createLocation"]:checked').value === 'default';
+	document.getElementById('createDefaultMode').classList.toggle('hidden', !useDefault);
+	document.getElementById('createCustomMode').classList.toggle('hidden', useDefault);
+}
+
+async function openVault(path, encrypted) {
+	if (encrypted) {
+		pendingVaultPath = path;
+		document.getElementById('vaultPassword').value = '';
+		document.getElementById('passwordError').classList.add('hidden');
+		document.getElementById('passwordModal').classList.remove('hidden');
+		document.getElementById('vaultPassword').focus();
+		return;
+	}
+	
+	await doOpenVault(path, null);
+}
+
+async function openVaultFromPath() {
+	const path = document.getElementById('openVaultPath').value.trim();
+	const password = document.getElementById('openVaultPassword').value;
+	
+	if (!path) {
+		showAlert('Please enter a vault path');
+		return;
+	}
+	
+	await doOpenVault(path, password || null);
+}
+
+async function doOpenVault(path, password) {
+	try {
+		const resp = await fetch('/api/vault/open', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ path, password })
+		});
+		
+		const data = await resp.json();
+		
+		if (!resp.ok) {
+			throw new Error(data.error || 'Failed to open vault');
+		}
+		
+		window.location.href = '/vault';
+	} catch (e) {
+		if (pendingVaultPath) {
+			document.getElementById('passwordError').textContent = e.message;
+			document.getElementById('passwordError').classList.remove('hidden');
+		} else {
+			showAlert(e.message);
+		}
+	}
+}
+
+function closePasswordModal() {
+	document.getElementById('passwordModal').classList.add('hidden');
+	pendingVaultPath = null;
+}
+
+async function submitPassword() {
+	const password = document.getElementById('vaultPassword').value;
+	await doOpenVault(pendingVaultPath, password);
+}
+
+async function createVault() {
+	const useDefault = document.querySelector('input[name="createLocation"]:checked').value === 'default';
+	const password = document.getElementById('newVaultPassword').value;
+	
+	let body = { password: password || null };
+	
+	if (useDefault) {
+		const name = document.getElementById('newVaultName').value.trim();
+		if (!name) {
+			showAlert('Please enter a vault name');
+			return;
+		}
+		body.name = name;
+		body.use_default_dir = true;
+	} else {
+		const path = document.getElementById('newVaultPath').value.trim();
+		if (!path) {
+			showAlert('Please enter a vault path');
+			return;
+		}
+		body.path = path;
+	}
+	
+	try {
+		const resp = await fetch('/api/vault/create', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(body)
+		});
+		
+		const data = await resp.json();
+		
+		if (!resp.ok) {
+			throw new Error(data.error || 'Failed to create vault');
+		}
+		
+		window.location.href = '/vault';
+	} catch (e) {
+		showAlert(e.message);
+	}
+}
+
+// File browser
+function showBrowser(mode) {
+	browserMode = mode;
+	document.getElementById('browserModal').classList.remove('hidden');
+	navigateTo('');
+}
+
+function closeBrowserModal() {
+	document.getElementById('browserModal').classList.add('hidden');
+	browserMode = null;
+}
+
+async function navigateTo(path) {
+	try {
+		const resp = await fetch('/api/vault/browse', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ path })
+		});
+		
+		const data = await resp.json();
+		
+		if (!resp.ok) {
+			throw new Error(data.error || 'Failed to browse');
+		}
+		
+		browserCurrentPath = data.current;
+		document.getElementById('browserCurrentPath').value = data.current;
+		
+		const list = document.getElementById('browserList');
+		
+		if (data.items.length === 0) {
+			list.innerHTML = '<div class="empty-state">No items found</div>';
+			return;
+		}
+		
+		list.innerHTML = data.items.map(item => `
+			<div class="browser-item ${item.is_vault ? 'vault' : ''}" 
+				onclick="${item.is_dir ? `navigateTo('${item.path.replace(/\\/g, '\\\\')}')` : ''}">
+				<span class="browser-item-icon">${item.is_dir ? '📁' : '📄'}</span>
+				<span class="browser-item-name">${item.name}</span>
+				${item.is_vault ? '<span class="browser-item-badge">VAULT</span>' : ''}
+			</div>
+		`).join('');
+		
+	} catch (e) {
+		showAlert(e.message);
+	}
+}
+
+function selectBrowserPath() {
+	const path = browserCurrentPath;
+	
+	if (browserMode === 'open') {
+		document.getElementById('openVaultPath').value = path;
+	} else if (browserMode === 'create') {
+		document.getElementById('newVaultPath').value = path;
+	}
+	
+	closeBrowserModal();
+}
+
+// Enter key handlers
+document.getElementById('vaultPassword')?.addEventListener('keypress', (e) => {
+	if (e.key === 'Enter') submitPassword();
+});
+
+document.getElementById('openVaultPath')?.addEventListener('keypress', (e) => {
+	if (e.key === 'Enter') openVaultFromPath();
+});
+
+document.getElementById('newVaultName')?.addEventListener('keypress', (e) => {
+	if (e.key === 'Enter') createVault();
+});
+
+document.getElementById('browserCurrentPath')?.addEventListener('keypress', (e) => {
+	if (e.key === 'Enter') navigateTo(e.target.value);
+});
+</script>
+{% endblock %}
