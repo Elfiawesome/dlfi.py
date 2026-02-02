@@ -867,3 +867,301 @@ def get_query_help():
             },
         ]
     })
+
+# ============ Settings ============
+
+@api_bp.route("/settings", methods=["GET"])
+@require_vault
+def get_settings():
+	"""Get current vault settings."""
+	dlfi = get_dlfi()
+	
+	return jsonify({
+		"encrypted": dlfi.config.encrypted,
+		"partition_size": dlfi.config.partition_size,
+		"partition_size_mb": dlfi.config.partition_size // (1024 * 1024) if dlfi.config.partition_size > 0 else 0
+	})
+
+
+@api_bp.route("/settings/encryption", methods=["POST"])
+@require_vault
+def update_encryption():
+	"""Enable, disable, or change encryption password."""
+	dlfi = get_dlfi()
+	data = request.get_json() or {}
+	
+	action = data.get("action")  # "enable", "disable", "change_password"
+	current_password = data.get("current_password") or None
+	new_password = data.get("new_password") or None
+	
+	config_manager = dlfi.config_manager
+	
+	try:
+		if action == "enable":
+			if dlfi.config.encrypted:
+				return jsonify({"error": "Vault is already encrypted"}), 400
+			if not new_password:
+				return jsonify({"error": "New password is required"}), 400
+			
+			success = config_manager.enable_encryption(new_password)
+			if success:
+				current_app.config["DLFI_PASSWORD"] = new_password
+				return jsonify({"success": True, "message": "Encryption enabled"})
+			else:
+				return jsonify({"error": "Failed to enable encryption"}), 500
+		
+		elif action == "disable":
+			if not dlfi.config.encrypted:
+				return jsonify({"error": "Vault is not encrypted"}), 400
+			if not current_password:
+				return jsonify({"error": "Current password is required"}), 400
+			
+			# Verify password first
+			stored_password = current_app.config.get("DLFI_PASSWORD")
+			if stored_password != current_password:
+				return jsonify({"error": "Incorrect password"}), 401
+			
+			success = config_manager.disable_encryption(current_password)
+			if success:
+				current_app.config["DLFI_PASSWORD"] = None
+				return jsonify({"success": True, "message": "Encryption disabled"})
+			else:
+				return jsonify({"error": "Failed to disable encryption"}), 500
+		
+		elif action == "change_password":
+			if not dlfi.config.encrypted:
+				return jsonify({"error": "Vault is not encrypted"}), 400
+			if not current_password or not new_password:
+				return jsonify({"error": "Both current and new passwords are required"}), 400
+			
+			# Verify password first
+			stored_password = current_app.config.get("DLFI_PASSWORD")
+			if stored_password != current_password:
+				return jsonify({"error": "Incorrect password"}), 401
+			
+			success = config_manager.change_password(current_password, new_password)
+			if success:
+				current_app.config["DLFI_PASSWORD"] = new_password
+				return jsonify({"success": True, "message": "Password changed"})
+			else:
+				return jsonify({"error": "Failed to change password"}), 500
+		
+		else:
+			return jsonify({"error": "Invalid action. Use: enable, disable, or change_password"}), 400
+			
+	except Exception as e:
+		logger.exception("Encryption settings error")
+		return jsonify({"error": str(e)}), 500
+
+
+@api_bp.route("/settings/partition", methods=["POST"])
+@require_vault
+def update_partition():
+	"""Update partition size setting."""
+	dlfi = get_dlfi()
+	data = request.get_json() or {}
+	
+	size_mb = data.get("size_mb")
+	
+	if size_mb is None:
+		return jsonify({"error": "size_mb is required"}), 400
+	
+	try:
+		size_mb = int(size_mb)
+	except (ValueError, TypeError):
+		return jsonify({"error": "size_mb must be a number"}), 400
+	
+	if size_mb < 0:
+		return jsonify({"error": "size_mb cannot be negative"}), 400
+	
+	size_bytes = size_mb * 1024 * 1024 if size_mb > 0 else 0
+	
+	try:
+		config_manager = dlfi.config_manager
+		success = config_manager.change_partition_size(size_bytes)
+		
+		if success:
+			return jsonify({
+				"success": True,
+				"message": f"Partition size set to {size_mb}MB" if size_mb > 0 else "Partitioning disabled"
+			})
+		else:
+			return jsonify({"error": "Failed to change partition size"}), 500
+	except Exception as e:
+		logger.exception("Partition settings error")
+		return jsonify({"error": str(e)}), 500
+
+
+# ============ Extractors ============
+
+@api_bp.route("/extractors", methods=["GET"])
+def list_extractors():
+	"""List available extractors."""
+	try:
+		import extractors
+		
+		extractor_list = []
+		for extractor in extractors.AVAILABLE_EXTRACTORS:
+			extractor_list.append({
+				"name": extractor.name,
+				"slug": getattr(extractor, 'slug', extractor.name.lower()),
+			})
+		
+		return jsonify({"extractors": extractor_list})
+	except ImportError:
+		return jsonify({"extractors": [], "error": "Extractors module not found"})
+	except Exception as e:
+		logger.exception("Failed to list extractors")
+		return jsonify({"extractors": [], "error": str(e)})
+
+
+@api_bp.route("/extractors/<slug>/config", methods=["GET"])
+def get_extractor_config(slug: str):
+	"""Get default configuration for an extractor."""
+	try:
+		import extractors
+		
+		for extractor in extractors.AVAILABLE_EXTRACTORS:
+			ext_slug = getattr(extractor, 'slug', extractor.name.lower())
+			if ext_slug == slug:
+				config = extractor.default_config()
+				return jsonify({
+					"name": extractor.name,
+					"slug": ext_slug,
+					"config": config
+				})
+		
+		return jsonify({"error": "Extractor not found"}), 404
+	except Exception as e:
+		logger.exception("Failed to get extractor config")
+		return jsonify({"error": str(e)}), 500
+
+
+@api_bp.route("/extractors/run", methods=["POST"])
+@require_vault
+def run_extractor():
+	"""Run an extractor on a URL."""
+	from dlfi.job import Job, JobConfig
+	
+	dlfi = get_dlfi()
+	data = request.get_json() or {}
+	
+	url = data.get("url", "").strip()
+	extractor_slug = data.get("extractor")  # Optional - auto-detect if not provided
+	config = data.get("config", {})
+	cookies_path = data.get("cookies_path")
+	
+	if not url:
+		return jsonify({"error": "URL is required"}), 400
+	
+	try:
+		import extractors
+		
+		# Find extractor
+		extractor = None
+		if extractor_slug:
+			for ext in extractors.AVAILABLE_EXTRACTORS:
+				ext_slug = getattr(ext, 'slug', ext.name.lower())
+				if ext_slug == extractor_slug:
+					extractor = ext
+					break
+			if not extractor:
+				return jsonify({"error": f"Extractor '{extractor_slug}' not found"}), 404
+		else:
+			# Auto-detect
+			extractor = extractors.get_extractor_for_url(url)
+			if not extractor:
+				return jsonify({"error": "No extractor found for this URL"}), 400
+		
+		# Create job
+		job_config = JobConfig(cookies=cookies_path)
+		job = Job(job_config)
+		job.db = dlfi
+		
+		# Run extraction (this is synchronous for now)
+		# In a production app, you'd want to run this in a background task
+		logger.info(f"Starting extraction: {url} with {extractor.name}")
+		
+		nodes_created = 0
+		files_added = 0
+		errors = []
+		
+		try:
+			for node in extractor.extract(url, config):
+				try:
+					if node.node_type == "VAULT":
+						dlfi.create_vault(node.suggested_path, metadata=node.metadata)
+					else:
+						dlfi.create_record(node.suggested_path, metadata=node.metadata)
+					
+					nodes_created += 1
+					
+					for tag in node.tags:
+						dlfi.add_tag(node.suggested_path, tag)
+					
+					for file_obj in node.files:
+						try:
+							dlfi.append_stream(
+								record_path=node.suggested_path,
+								file_stream=file_obj.stream,
+								filename=file_obj.original_name
+							)
+							files_added += 1
+						except Exception as e:
+							errors.append(f"File {file_obj.original_name}: {str(e)}")
+					
+					for rel_name, target_path in node.relationships:
+						try:
+							dlfi.link(node.suggested_path, target_path, rel_name)
+						except ValueError:
+							pass  # Target may not exist yet
+				
+				except Exception as e:
+					errors.append(f"Node {node.suggested_path}: {str(e)}")
+		
+		except Exception as e:
+			errors.append(f"Extraction error: {str(e)}")
+		
+		return jsonify({
+			"success": True,
+			"nodes_created": nodes_created,
+			"files_added": files_added,
+			"errors": errors[:10]  # Limit error list
+		})
+		
+	except ImportError as e:
+		return jsonify({"error": f"Import error: {str(e)}"}), 500
+	except Exception as e:
+		logger.exception("Extractor run failed")
+		return jsonify({"error": str(e)}), 500
+
+
+@api_bp.route("/nodes/<uuid>/preview", methods=["GET"])
+@require_vault
+def get_node_preview(uuid: str):
+	"""Get preview info for a node (first previewable file)."""
+	dlfi = get_dlfi()
+	
+	cursor = dlfi.conn.execute("""
+		SELECT nf.file_hash, b.ext, b.size_bytes
+		FROM node_files nf
+		JOIN blobs b ON nf.file_hash = b.hash
+		WHERE nf.node_uuid = ?
+		ORDER BY nf.display_order
+		LIMIT 1
+	""", (uuid,))
+	
+	row = cursor.fetchone()
+	if not row:
+		return jsonify({"has_preview": False})
+	
+	file_hash, ext, size = row
+	previewable = ext in ('jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'mp4', 'webm', 'mov')
+	
+	return jsonify({
+		"has_preview": previewable,
+		"hash": file_hash if previewable else None,
+		"ext": ext,
+		"size": size,
+		"is_video": ext in ('mp4', 'webm', 'mov')
+	})

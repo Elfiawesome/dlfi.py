@@ -10,6 +10,8 @@
 {% endblock %}
 
 {% block header_right %}
+<button class="btn btn-sm btn-secondary" onclick="App.showExtractorModal()">Extract</button>
+<button class="btn btn-sm btn-secondary" onclick="App.showSettingsModal()">Settings</button>
 <button class="btn btn-sm btn-secondary" onclick="App.showCreateNode('VAULT')">+ Vault</button>
 <button class="btn btn-sm btn-secondary" onclick="App.showCreateNode('RECORD')">+ Record</button>
 <button class="btn btn-sm btn-secondary" onclick="App.exportStatic()">Export</button>
@@ -28,6 +30,10 @@
 				autocomplete="off"
 				spellcheck="false">
 			<div id="autocompleteDropdown" class="autocomplete-dropdown hidden"></div>
+		</div>
+		<div class="view-toggle">
+			<button class="view-btn active" data-view="gallery" onclick="App.setView('gallery')" title="Gallery View">▦</button>
+			<button class="view-btn" data-view="list" onclick="App.setView('list')" title="List View">☰</button>
 		</div>
 		<button class="btn btn-secondary" id="queryHelpBtn" title="Query Help">?</button>
 	</div>
@@ -119,6 +125,24 @@
 	</div>
 </div>
 
+<!-- Metadata Editor Modal -->
+<div id="metadataEditorModal" class="modal-overlay hidden">
+	<div class="modal modal-lg">
+		<div class="modal-header">
+			<h2 class="modal-title">Edit Metadata</h2>
+		</div>
+		<div class="modal-body">
+			<p class="form-hint mb-3">Edit the JSON metadata. Supports nested objects and arrays.</p>
+			<div id="metadataEditorError" class="alert alert-error hidden mb-3"></div>
+			<textarea id="metadataJsonEditor" class="form-input metadata-editor" spellcheck="false"></textarea>
+		</div>
+		<div class="modal-footer">
+			<button class="btn btn-secondary" onclick="document.getElementById('metadataEditorModal').classList.add('hidden')">Cancel</button>
+			<button class="btn btn-primary" onclick="App.saveMetadata()">Save</button>
+		</div>
+	</div>
+</div>
+
 <!-- Query Help Modal -->
 <div id="queryHelpModal" class="modal-overlay hidden">
 	<div class="modal modal-xl">
@@ -134,22 +158,133 @@
 	</div>
 </div>
 
-<!-- Metadata Editor Modal -->
-<div id="metadataEditorModal" class="modal-overlay hidden">
-    <div class="modal modal-lg">
-        <div class="modal-header">
-            <h2 class="modal-title">Edit Metadata</h2>
-        </div>
-        <div class="modal-body">
-            <p class="form-hint mb-3">Edit the JSON metadata. Supports nested objects and arrays.</p>
-            <div id="metadataEditorError" class="alert alert-error hidden mb-3"></div>
-            <textarea id="metadataJsonEditor" class="form-input metadata-editor" spellcheck="false"></textarea>
-        </div>
-        <div class="modal-footer">
-            <button class="btn btn-secondary" onclick="document.getElementById('metadataEditorModal').classList.add('hidden')">Cancel</button>
-            <button class="btn btn-primary" onclick="App.saveMetadata()">Save</button>
-        </div>
-    </div>
+<!-- Settings Modal -->
+<div id="settingsModal" class="modal-overlay hidden">
+	<div class="modal modal-lg">
+		<div class="modal-header">
+			<h2 class="modal-title">Vault Settings</h2>
+		</div>
+		<div class="modal-body">
+			<div id="settingsError" class="alert alert-error hidden mb-3"></div>
+			<div id="settingsSuccess" class="alert alert-success hidden mb-3"></div>
+			
+			<!-- Encryption Section -->
+			<div class="settings-section">
+				<h3 class="settings-section-title">Encryption</h3>
+				<div id="encryptionStatus" class="settings-status"></div>
+				
+				<div id="encryptionEnable" class="settings-form hidden">
+					<p class="form-hint mb-3">Enable encryption to protect your vault with a password.</p>
+					<div class="form-group">
+						<label class="form-label">New Password</label>
+						<input type="password" id="enableEncryptionPassword" class="form-input" placeholder="Enter password">
+					</div>
+					<div class="form-group">
+						<label class="form-label">Confirm Password</label>
+						<input type="password" id="enableEncryptionConfirm" class="form-input" placeholder="Confirm password">
+					</div>
+					<button class="btn btn-primary" onclick="App.enableEncryption()">Enable Encryption</button>
+				</div>
+				
+				<div id="encryptionManage" class="settings-form hidden">
+					<div class="settings-actions">
+						<button class="btn btn-secondary" onclick="App.showChangePassword()">Change Password</button>
+						<button class="btn btn-danger" onclick="App.showDisableEncryption()">Disable Encryption</button>
+					</div>
+					
+					<div id="changePasswordForm" class="hidden mt-3">
+						<div class="form-group">
+							<label class="form-label">Current Password</label>
+							<input type="password" id="currentPassword" class="form-input" placeholder="Current password">
+						</div>
+						<div class="form-group">
+							<label class="form-label">New Password</label>
+							<input type="password" id="newPassword" class="form-input" placeholder="New password">
+						</div>
+						<div class="form-group">
+							<label class="form-label">Confirm New Password</label>
+							<input type="password" id="confirmNewPassword" class="form-input" placeholder="Confirm new password">
+						</div>
+						<button class="btn btn-primary" onclick="App.changePassword()">Change Password</button>
+						<button class="btn btn-secondary" onclick="App.hideChangePassword()">Cancel</button>
+					</div>
+					
+					<div id="disableEncryptionForm" class="hidden mt-3">
+						<p class="text-error mb-3">Warning: This will decrypt all files. This operation cannot be undone.</p>
+						<div class="form-group">
+							<label class="form-label">Current Password</label>
+							<input type="password" id="disableEncryptionPassword" class="form-input" placeholder="Enter current password">
+						</div>
+						<button class="btn btn-danger" onclick="App.disableEncryption()">Disable Encryption</button>
+						<button class="btn btn-secondary" onclick="App.hideDisableEncryption()">Cancel</button>
+					</div>
+				</div>
+			</div>
+			
+			<!-- Partition Section -->
+			<div class="settings-section">
+				<h3 class="settings-section-title">File Partitioning</h3>
+				<p class="form-hint mb-3">Split large files into smaller chunks. Useful for Git hosting limits.</p>
+				<div class="form-group">
+					<label class="form-label">Partition Size (MB)</label>
+					<input type="number" id="partitionSizeMb" class="form-input" min="0" placeholder="50">
+					<p class="form-hint">Set to 0 to disable partitioning. Minimum 1MB if enabled.</p>
+				</div>
+				<button class="btn btn-primary" onclick="App.updatePartitionSize()">Update Partition Size</button>
+			</div>
+		</div>
+		<div class="modal-footer">
+			<button class="btn btn-secondary" onclick="App.closeSettingsModal()">Close</button>
+		</div>
+	</div>
+</div>
+
+<!-- Extractor Modal -->
+<div id="extractorModal" class="modal-overlay hidden">
+	<div class="modal modal-lg">
+		<div class="modal-header">
+			<h2 class="modal-title">Run Extractor</h2>
+		</div>
+		<div class="modal-body">
+			<div id="extractorError" class="alert alert-error hidden mb-3"></div>
+			<div id="extractorSuccess" class="alert alert-success hidden mb-3"></div>
+			
+			<div class="form-group">
+				<label class="form-label">URL</label>
+				<input type="text" id="extractorUrl" class="form-input" placeholder="https://example.com/...">
+			</div>
+			
+			<div class="form-group">
+				<label class="form-label">Extractor</label>
+				<select id="extractorSelect" class="form-input" onchange="App.loadExtractorConfig()">
+					<option value="">Auto-detect</option>
+				</select>
+			</div>
+			
+			<div class="form-group">
+				<label class="form-label">Cookies File Path <span class="form-label-hint">(optional)</span></label>
+				<input type="text" id="extractorCookies" class="form-input" placeholder="C:\path\to\cookies.txt">
+			</div>
+			
+			<div id="extractorConfigSection" class="hidden">
+				<div class="form-group">
+					<label class="form-label">Configuration</label>
+					<div id="extractorConfigFields"></div>
+				</div>
+			</div>
+			
+			<div id="extractorProgress" class="hidden">
+				<div class="progress-info">
+					<span class="spinner-small"></span>
+					<span>Extracting...</span>
+				</div>
+			</div>
+		</div>
+		<div class="modal-footer">
+			<button class="btn btn-secondary" onclick="App.closeExtractorModal()">Cancel</button>
+			<button class="btn btn-primary" id="runExtractorBtn" onclick="App.runExtractor()">Run Extractor</button>
+		</div>
+	</div>
 </div>
 {% endblock %}
 
@@ -161,6 +296,10 @@ document.getElementById('newTagInput')?.addEventListener('keypress', (e) => {
 
 document.getElementById('createNodePath')?.addEventListener('keypress', (e) => {
 	if (e.key === 'Enter') App.createNode();
+});
+
+document.getElementById('extractorUrl')?.addEventListener('keypress', (e) => {
+	if (e.key === 'Enter') App.runExtractor();
 });
 </script>
 {% endblock %}

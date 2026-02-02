@@ -9,6 +9,9 @@ const App = {
 	queryResults: [],
 	autocompleteTimeout: null,
 	autocompleteIndex: -1,
+	currentView: 'gallery',
+	extractors: [],
+	extractorConfigs: {},
 	
 	/**
 	 * Initialize the application
@@ -18,7 +21,8 @@ const App = {
 		this.initQueryInput();
 		await Promise.all([
 			this.loadTree(),
-			this.executeQuery('')
+			this.executeQuery(''),
+			this.loadExtractors()
 		]);
 	},
 	
@@ -26,7 +30,6 @@ const App = {
 	 * Bind global event handlers
 	 */
 	bindEvents() {
-		// Close modals on overlay click
 		document.querySelectorAll('.modal-overlay').forEach(overlay => {
 			overlay.addEventListener('click', (e) => {
 				if (e.target === overlay) {
@@ -35,7 +38,6 @@ const App = {
 			});
 		});
 		
-		// Lightbox
 		const lightbox = document.getElementById('lightbox');
 		if (lightbox) {
 			document.getElementById('lightboxClose')?.addEventListener('click', () => {
@@ -48,7 +50,6 @@ const App = {
 			});
 		}
 		
-		// Keyboard shortcuts
 		document.addEventListener('keydown', (e) => {
 			if (e.key === 'Escape') {
 				document.querySelectorAll('.modal-overlay').forEach(m => m.classList.add('hidden'));
@@ -56,7 +57,6 @@ const App = {
 				this.hideAutocomplete();
 			}
 			
-			// Focus search with /
 			if (e.key === '/' && document.activeElement.tagName !== 'INPUT' && document.activeElement.tagName !== 'TEXTAREA') {
 				e.preventDefault();
 				document.getElementById('queryInput')?.focus();
@@ -65,14 +65,23 @@ const App = {
 	},
 	
 	/**
+	 * Set view mode (gallery or list)
+	 */
+	setView(view) {
+		this.currentView = view;
+		document.querySelectorAll('.view-btn').forEach(btn => {
+			btn.classList.toggle('active', btn.dataset.view === view);
+		});
+		this.renderQueryResults({ nodes: this.queryResults, total: this.queryResults.length });
+	},
+	
+	/**
 	 * Initialize query input with autocomplete
 	 */
 	initQueryInput() {
 		const input = document.getElementById('queryInput');
-		
 		if (!input) return;
 		
-		// Show autocomplete on focus (even if empty)
 		input.addEventListener('focus', () => {
 			clearTimeout(this.autocompleteTimeout);
 			this.autocompleteTimeout = setTimeout(() => {
@@ -80,7 +89,6 @@ const App = {
 			}, 50);
 		});
 		
-		// Input handler with debounce for autocomplete
 		input.addEventListener('input', (e) => {
 			clearTimeout(this.autocompleteTimeout);
 			this.autocompleteTimeout = setTimeout(() => {
@@ -88,7 +96,6 @@ const App = {
 			}, 100);
 		});
 		
-		// Handle keyboard navigation
 		input.addEventListener('keydown', (e) => {
 			const dropdown = document.getElementById('autocompleteDropdown');
 			const isDropdownVisible = dropdown && !dropdown.classList.contains('hidden');
@@ -122,35 +129,21 @@ const App = {
 			}
 		});
 		
-		// Hide on blur with delay
 		input.addEventListener('blur', () => {
 			setTimeout(() => this.hideAutocomplete(), 150);
 		});
 		
-		// Help button
 		document.getElementById('queryHelpBtn')?.addEventListener('click', () => {
 			this.showQueryHelp();
 		});
 	},
 	
-	/**
-	 * Fetch autocomplete suggestions
-	 */
 	async fetchAutocomplete(query, cursorPos) {
 		try {
-			const params = new URLSearchParams({
-				q: query || '',
-				cursor: (cursorPos || 0).toString()
-			});
-			
+			const params = new URLSearchParams({ q: query || '', cursor: (cursorPos || 0).toString() });
 			const resp = await fetch(`/api/autocomplete?${params}`);
-			if (!resp.ok) {
-				console.error('Autocomplete request failed:', resp.status);
-				return;
-			}
-			
+			if (!resp.ok) return;
 			const data = await resp.json();
-			
 			if (data.suggestions && data.suggestions.length > 0) {
 				this.showAutocomplete(data.suggestions, query, cursorPos);
 			} else {
@@ -161,24 +154,16 @@ const App = {
 		}
 	},
 	
-	/**
-	 * Show autocomplete dropdown
-	 */
 	showAutocomplete(suggestions, query, cursorPos) {
 		const dropdown = document.getElementById('autocompleteDropdown');
-		if (!dropdown) return;
-		
-		if (!suggestions || !suggestions.length) {
+		if (!dropdown || !suggestions?.length) {
 			this.hideAutocomplete();
 			return;
 		}
 		
-		// Store context for insertion
 		this._autocompleteContext = this._getInsertionContext(query || '', cursorPos || 0);
-		
 		this.autocompleteIndex = 0;
 		
-		// Group by section
 		const grouped = {};
 		suggestions.forEach(s => {
 			const section = s.section || 'Suggestions';
@@ -210,14 +195,11 @@ const App = {
 		dropdown.innerHTML = html;
 		dropdown.classList.remove('hidden');
 		
-		// Add event handlers
 		dropdown.querySelectorAll('.autocomplete-item').forEach(item => {
 			item.addEventListener('mousedown', (e) => {
 				e.preventDefault();
-				e.stopPropagation();
 				this.applyAutocomplete(item.dataset.insert, item.dataset.type);
 			});
-			
 			item.addEventListener('mouseenter', () => {
 				dropdown.querySelectorAll('.autocomplete-item').forEach(i => i.classList.remove('active'));
 				item.classList.add('active');
@@ -226,50 +208,28 @@ const App = {
 		});
 	},
 	
-	/**
-	 * Get insertion context - figure out what part of the query to replace
-	 */
 	_getInsertionContext(query, cursorPos) {
-		// Find token start
 		let tokenStart = cursorPos;
 		while (tokenStart > 0 && !/[\s|()]/.test(query[tokenStart - 1])) {
 			tokenStart--;
 		}
-		
 		const token = query.slice(tokenStart, cursorPos);
-		
-		// Check if token has an operator (: or =)
 		let operatorPos = -1;
 		for (const op of [':', '=']) {
 			const pos = token.indexOf(op);
-			if (pos !== -1) {
-				operatorPos = pos;
-				break;
-			}
+			if (pos !== -1) { operatorPos = pos; break; }
 		}
-		
 		if (operatorPos !== -1) {
-			// We're after an operator, only replace the value part
 			return {
 				replaceStart: tokenStart + operatorPos + 1,
 				replaceEnd: cursorPos,
 				hasOperator: true,
 				prefix: token.slice(0, operatorPos + 1)
 			};
-		} else {
-			// Replace the whole token
-			return {
-				replaceStart: tokenStart,
-				replaceEnd: cursorPos,
-				hasOperator: false,
-				prefix: ''
-			};
 		}
+		return { replaceStart: tokenStart, replaceEnd: cursorPos, hasOperator: false, prefix: '' };
 	},
 	
-	/**
-	 * Hide autocomplete dropdown
-	 */
 	hideAutocomplete() {
 		const dropdown = document.getElementById('autocompleteDropdown');
 		if (dropdown) {
@@ -277,25 +237,17 @@ const App = {
 			dropdown.innerHTML = '';
 		}
 		this.autocompleteIndex = -1;
-		this._autocompleteContext = null;
 	},
 	
-	/**
-	 * Navigate autocomplete items
-	 */
 	navigateAutocomplete(direction) {
 		const dropdown = document.getElementById('autocompleteDropdown');
 		if (!dropdown || dropdown.classList.contains('hidden')) return;
-		
 		const items = dropdown.querySelectorAll('.autocomplete-item');
 		if (!items.length) return;
-		
 		items.forEach(item => item.classList.remove('active'));
-		
 		this.autocompleteIndex += direction;
 		if (this.autocompleteIndex < 0) this.autocompleteIndex = items.length - 1;
 		if (this.autocompleteIndex >= items.length) this.autocompleteIndex = 0;
-		
 		const activeItem = items[this.autocompleteIndex];
 		if (activeItem) {
 			activeItem.classList.add('active');
@@ -303,51 +255,35 @@ const App = {
 		}
 	},
 	
-	/**
-	 * Select current autocomplete item
-	 */
 	selectAutocomplete() {
 		const dropdown = document.getElementById('autocompleteDropdown');
-		if (!dropdown) return;
-		
-		const active = dropdown.querySelector('.autocomplete-item.active');
-		if (active && active.dataset.insert) {
+		const active = dropdown?.querySelector('.autocomplete-item.active');
+		if (active?.dataset.insert) {
 			this.applyAutocomplete(active.dataset.insert, active.dataset.type);
 		}
 	},
 	
-	/**
-	 * Apply autocomplete selection
-	 */
 	applyAutocomplete(insertText, itemType) {
 		const input = document.getElementById('queryInput');
 		if (!input || !insertText) return;
 		
 		const ctx = this._autocompleteContext;
 		const value = input.value;
+		let newValue, newPos;
 		
-		let newValue;
-		let newPos;
-		
-		if (ctx && ctx.hasOperator) {
-			// Only replace the value part after the operator
-			// Check if insertText already includes the prefix (like "tag:value")
+		if (ctx?.hasOperator) {
 			if (insertText.includes(':') || insertText.includes('=')) {
-				// Full replacement (like "tag:mytag" or "inside:path")
 				const tokenStart = ctx.replaceStart - ctx.prefix.length;
 				newValue = value.slice(0, tokenStart) + insertText + value.slice(ctx.replaceEnd);
 				newPos = tokenStart + insertText.length;
 			} else {
-				// Just the value part
 				newValue = value.slice(0, ctx.replaceStart) + insertText + value.slice(ctx.replaceEnd);
 				newPos = ctx.replaceStart + insertText.length;
 			}
 		} else if (ctx) {
-			// Replace whole token
 			newValue = value.slice(0, ctx.replaceStart) + insertText + value.slice(ctx.replaceEnd);
 			newPos = ctx.replaceStart + insertText.length;
 		} else {
-			// Fallback
 			newValue = insertText;
 			newPos = insertText.length;
 		}
@@ -355,25 +291,17 @@ const App = {
 		input.value = newValue;
 		input.setSelectionRange(newPos, newPos);
 		input.focus();
-		
 		this.hideAutocomplete();
 		
-		// Fetch new suggestions if the insert ends with : or =
 		if (insertText.endsWith(':') || insertText.endsWith('=')) {
-			setTimeout(() => {
-				this.fetchAutocomplete(input.value, input.selectionStart);
-			}, 50);
+			setTimeout(() => this.fetchAutocomplete(input.value, input.selectionStart), 50);
 		}
 	},
 	
-	/**
-	 * Load tree view
-	 */
 	async loadTree() {
 		try {
 			const resp = await fetch('/api/nodes');
 			if (!resp.ok) throw new Error('Failed to load nodes');
-			
 			const data = await resp.json();
 			this.treeNodes = data.nodes;
 			this.renderTree();
@@ -383,16 +311,10 @@ const App = {
 		}
 	},
 	
-	/**
-	 * Refresh tree
-	 */
 	async refreshTree() {
 		await this.loadTree();
 	},
 	
-	/**
-	 * Render tree view
-	 */
 	renderTree() {
 		const tree = document.getElementById('treeView');
 		if (!tree) return;
@@ -403,7 +325,6 @@ const App = {
 		}
 		
 		tree.innerHTML = '';
-		
 		const rootNodes = this.treeNodes.filter(n => !n.parent);
 		
 		const renderNode = (node, depth = 0) => {
@@ -411,17 +332,13 @@ const App = {
 			div.className = `tree-item ${node.type.toLowerCase()}`;
 			div.style.paddingLeft = `${12 + depth * 14}px`;
 			div.dataset.uuid = node.uuid;
-			
 			const icon = node.type === 'VAULT' ? '📁' : '📄';
 			const badge = node.file_count > 0 ? `<span class="tree-badge">${node.file_count}</span>` : '';
-			
 			div.innerHTML = `<span class="tree-icon">${icon}</span><span class="tree-name">${this.escapeHtml(node.name)}</span>${badge}`;
-			
 			div.addEventListener('click', (e) => {
 				e.stopPropagation();
 				this.selectNodeFromTree(node.uuid);
 			});
-			
 			tree.appendChild(div);
 			
 			const children = this.treeNodes.filter(n => n.parent === node.uuid);
@@ -439,29 +356,20 @@ const App = {
 		rootNodes.forEach(node => renderNode(node));
 	},
 	
-	/**
-	 * Select node from tree and update query
-	 */
 	selectNodeFromTree(uuid) {
 		const node = this.treeNodes.find(n => n.uuid === uuid);
 		if (!node) return;
-		
 		document.querySelectorAll('.tree-item').forEach(el => {
 			el.classList.toggle('active', el.dataset.uuid === uuid);
 		});
-		
 		const input = document.getElementById('queryInput');
 		if (input) {
 			input.value = `inside:${node.path}`;
 			this.executeQuery(input.value);
 		}
-		
 		this.selectNode(uuid);
 	},
 	
-	/**
-	 * Execute a query
-	 */
 	async executeQuery(query) {
 		const resultsContainer = document.getElementById('queryResults');
 		const statsContainer = document.getElementById('queryStats');
@@ -476,12 +384,8 @@ const App = {
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ query })
 			});
-			
 			const data = await resp.json();
-			
-			if (!resp.ok) {
-				throw new Error(data.error || 'Query failed');
-			}
+			if (!resp.ok) throw new Error(data.error || 'Query failed');
 			
 			this.queryResults = data.nodes;
 			this.renderQueryResults(data);
@@ -489,7 +393,6 @@ const App = {
 			if (statsContainer) {
 				statsContainer.textContent = `${data.total} results (${data.query_time_ms}ms)`;
 			}
-			
 		} catch (e) {
 			console.error('Query failed:', e);
 			if (resultsContainer) {
@@ -503,9 +406,6 @@ const App = {
 		}
 	},
 	
-	/**
-	 * Render query results
-	 */
 	renderQueryResults(data) {
 		const container = document.getElementById('queryResults');
 		if (!container) return;
@@ -521,17 +421,65 @@ const App = {
 			return;
 		}
 		
-		container.innerHTML = `
-			<div class="results-list">
-				${data.nodes.map(node => this.renderResultItem(node)).join('')}
+		if (this.currentView === 'gallery') {
+			container.innerHTML = `<div class="gallery-grid">${data.nodes.map(node => this.renderGalleryItem(node)).join('')}</div>`;
+		} else {
+			container.innerHTML = `<div class="results-list">${data.nodes.map(node => this.renderListItem(node)).join('')}</div>`;
+		}
+	},
+	
+	renderGalleryItem(node) {
+		const isRecord = node.type === 'RECORD';
+		const hasFiles = node.file_count > 0;
+		
+		let preview = '';
+		if (isRecord && hasFiles) {
+			preview = `<div class="gallery-preview" data-uuid="${node.uuid}"><div class="loading"><div class="spinner"></div></div></div>`;
+			this.loadPreview(node.uuid);
+		} else {
+			const icon = node.type === 'VAULT' ? '📁' : '📄';
+			preview = `<div class="gallery-preview gallery-no-preview"><span class="gallery-icon">${icon}</span></div>`;
+		}
+		
+		return `
+			<div class="gallery-item" onclick="App.selectNode('${node.uuid}')">
+				${preview}
+				<div class="gallery-info">
+					<div class="gallery-name" title="${this.escapeAttr(node.name)}">${this.escapeHtml(node.name)}</div>
+					<div class="gallery-meta">
+						${node.file_count > 0 ? `<span>${node.file_count} files</span>` : ''}
+						${node.tags.length > 0 ? `<span class="gallery-tag">${this.escapeHtml(node.tags[0])}</span>` : ''}
+					</div>
+				</div>
 			</div>
 		`;
 	},
 	
-	/**
-	 * Render a single result item
-	 */
-	renderResultItem(node) {
+	async loadPreview(uuid) {
+		try {
+			const resp = await fetch(`/api/nodes/${uuid}/preview`);
+			if (!resp.ok) return;
+			const data = await resp.json();
+			
+			const container = document.querySelector(`.gallery-preview[data-uuid="${uuid}"]`);
+			if (!container) return;
+			
+			if (data.has_preview && data.hash) {
+				if (data.is_video) {
+					container.innerHTML = `<video src="/api/blobs/${data.hash}" muted loop onmouseenter="this.play()" onmouseleave="this.pause()"></video>`;
+				} else {
+					container.innerHTML = `<img src="/api/blobs/${data.hash}" alt="" loading="lazy">`;
+				}
+			} else {
+				container.innerHTML = `<span class="gallery-icon">📄</span>`;
+				container.classList.add('gallery-no-preview');
+			}
+		} catch (e) {
+			console.error('Failed to load preview:', e);
+		}
+	},
+	
+	renderListItem(node) {
 		const icon = node.type === 'VAULT' ? '📁' : '📄';
 		const tags = node.tags.slice(0, 3).map(t => `<span class="result-tag">${this.escapeHtml(t)}</span>`).join('');
 		const moreTags = node.tags.length > 3 ? `<span class="result-tag-more">+${node.tags.length - 3}</span>` : '';
@@ -552,17 +500,12 @@ const App = {
 		`;
 	},
 	
-	/**
-	 * Show query help modal
-	 */
 	async showQueryHelp() {
 		try {
 			const resp = await fetch('/api/query/help');
 			const data = await resp.json();
-			
 			const modal = document.getElementById('queryHelpModal');
 			const content = document.getElementById('queryHelpContent');
-			
 			if (modal && content) {
 				content.innerHTML = data.syntax.map(cat => `
 					<div class="help-category">
@@ -577,7 +520,6 @@ const App = {
 						</div>
 					</div>
 				`).join('');
-				
 				modal.classList.remove('hidden');
 			}
 		} catch (e) {
@@ -585,9 +527,6 @@ const App = {
 		}
 	},
 	
-	/**
-	 * Select and display a node
-	 */
 	async selectNode(uuid) {
 		document.querySelectorAll('.tree-item').forEach(el => {
 			el.classList.toggle('active', el.dataset.uuid === uuid);
@@ -596,7 +535,6 @@ const App = {
 		try {
 			const resp = await fetch(`/api/nodes/${uuid}`);
 			if (!resp.ok) throw new Error('Failed to load node');
-			
 			const node = await resp.json();
 			this.currentNode = node;
 			this.renderNodeDetail(node);
@@ -606,13 +544,9 @@ const App = {
 		}
 	},
 	
-	/**
-	 * Render node details
-	 */
 	renderNodeDetail(node) {
 		const panel = document.getElementById('detailPanel');
 		if (!panel) return;
-		
 		panel.classList.remove('hidden');
 		
 		const header = document.getElementById('detailHeader');
@@ -629,23 +563,17 @@ const App = {
 			`;
 		}
 		
-		let html = '';
+		let html = `<div class="detail-type-badge ${node.type.toLowerCase()}">${node.type}</div>`;
 		
-		html += `<div class="detail-type-badge ${node.type.toLowerCase()}">${node.type}</div>`;
-		
-		// Hero preview for first file (if image/video)
-		if (node.files && node.files.length > 0) {
+		// Hero preview
+		if (node.files?.length > 0) {
 			const firstFile = node.files[0];
 			const isImage = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'].includes(firstFile.ext);
 			const isVideo = ['mp4', 'webm', 'mov'].includes(firstFile.ext);
-			
 			if (isImage || isVideo) {
 				html += `
 					<div class="hero-preview" onclick="App.openFile('${firstFile.hash}', '${firstFile.ext}', '${this.escapeAttr(firstFile.name)}')">
-						${isImage 
-							? `<img src="/api/blobs/${firstFile.hash}" alt="${this.escapeAttr(firstFile.name)}" loading="lazy">`
-							: `<video src="/api/blobs/${firstFile.hash}" controls></video>`
-						}
+						${isImage ? `<img src="/api/blobs/${firstFile.hash}" alt="${this.escapeAttr(firstFile.name)}">` : `<video src="/api/blobs/${firstFile.hash}" controls></video>`}
 					</div>
 				`;
 			}
@@ -659,10 +587,7 @@ const App = {
 					<button class="btn btn-sm btn-secondary" onclick="App.showMetadataEditor()">Edit</button>
 				</div>
 				<div class="panel-body">
-					${Object.keys(node.metadata).length > 0 
-						? `<div class="meta-tree">${this.renderMetadataTree(node.metadata)}</div>`
-						: '<p class="text-muted">No metadata</p>'
-					}
+					${Object.keys(node.metadata).length > 0 ? `<div class="meta-tree">${this.renderMetadataTree(node.metadata)}</div>` : '<p class="text-muted">No metadata</p>'}
 				</div>
 			</div>
 		`;
@@ -675,22 +600,13 @@ const App = {
 					<button class="btn btn-sm btn-secondary" onclick="App.showAddTag()">Add</button>
 				</div>
 				<div class="panel-body">
-					${node.tags.length > 0 ? `
-						<div class="tags">
-							${node.tags.map(t => `
-								<span class="tag">
-									${this.escapeHtml(t)}
-									<span class="tag-remove" onclick="App.removeTag('${this.escapeAttr(t)}')">&times;</span>
-								</span>
-							`).join('')}
-						</div>
-					` : '<p class="text-muted">No tags</p>'}
+					${node.tags.length > 0 ? `<div class="tags">${node.tags.map(t => `<span class="tag">${this.escapeHtml(t)}<span class="tag-remove" onclick="App.removeTag('${this.escapeAttr(t)}')">&times;</span></span>`).join('')}</div>` : '<p class="text-muted">No tags</p>'}
 				</div>
 			</div>
 		`;
 		
 		// Relationships
-		if (node.relationships && node.relationships.length > 0) {
+		if (node.relationships?.length > 0) {
 			html += `
 				<div class="panel">
 					<div class="panel-header"><span class="panel-title">Relationships</span></div>
@@ -709,8 +625,8 @@ const App = {
 			`;
 		}
 		
-		// Files (excluding first if shown as hero)
-		if (node.files && node.files.length > 0) {
+		// Files
+		if (node.files?.length > 0) {
 			const firstFile = node.files[0];
 			const isFirstPreviewable = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'mp4', 'webm', 'mov'].includes(firstFile.ext);
 			const filesToShow = isFirstPreviewable ? node.files.slice(1) : node.files;
@@ -722,11 +638,7 @@ const App = {
 						<button class="btn btn-sm btn-secondary" onclick="App.showUploadFile()">Upload</button>
 					</div>
 					<div class="panel-body">
-						${filesToShow.length > 0 ? `
-							<div class="files-grid">
-								${filesToShow.map(f => this.renderFileCard(f)).join('')}
-							</div>
-						` : (isFirstPreviewable ? '<p class="text-muted">No additional files</p>' : '')}
+						${filesToShow.length > 0 ? `<div class="files-grid">${filesToShow.map(f => this.renderFileCard(f)).join('')}</div>` : (isFirstPreviewable ? '<p class="text-muted">No additional files</p>' : '')}
 					</div>
 				</div>
 			`;
@@ -737,15 +649,13 @@ const App = {
 						<span class="panel-title">Files</span>
 						<button class="btn btn-sm btn-secondary" onclick="App.showUploadFile()">Upload</button>
 					</div>
-					<div class="panel-body">
-						<p class="text-muted">No files attached</p>
-					</div>
+					<div class="panel-body"><p class="text-muted">No files attached</p></div>
 				</div>
 			`;
 		}
 		
 		// Children
-		if (node.children && node.children.length > 0) {
+		if (node.children?.length > 0) {
 			html += `
 				<div class="panel">
 					<div class="panel-header"><span class="panel-title">Contents (${node.children.length})</span></div>
@@ -764,72 +674,30 @@ const App = {
 			`;
 		}
 		
-		if (body) {
-			body.innerHTML = html;
-		}
+		if (body) body.innerHTML = html;
 	},
 	
-	/**
-	 * Render metadata as a tree (supports nested objects/arrays)
-	 */
 	renderMetadataTree(obj, depth = 0) {
-		if (obj === null || obj === undefined) {
-			return '<span class="meta-null">null</span>';
-		}
-		
+		if (obj === null || obj === undefined) return '<span class="meta-null">null</span>';
 		if (typeof obj !== 'object') {
-			if (typeof obj === 'string') {
-				return `<span class="meta-string">"${this.escapeHtml(obj)}"</span>`;
-			} else if (typeof obj === 'number') {
-				return `<span class="meta-number">${obj}</span>`;
-			} else if (typeof obj === 'boolean') {
-				return `<span class="meta-boolean">${obj}</span>`;
-			}
+			if (typeof obj === 'string') return `<span class="meta-string">"${this.escapeHtml(obj)}"</span>`;
+			if (typeof obj === 'number') return `<span class="meta-number">${obj}</span>`;
+			if (typeof obj === 'boolean') return `<span class="meta-boolean">${obj}</span>`;
 			return `<span class="meta-value">${this.escapeHtml(String(obj))}</span>`;
 		}
-		
 		if (Array.isArray(obj)) {
-			if (obj.length === 0) {
-				return '<span class="meta-empty">[]</span>';
-			}
-			return `
-				<div class="meta-array">
-					${obj.map((item, i) => `
-						<div class="meta-array-item" style="padding-left: ${depth * 16}px">
-							<span class="meta-index">[${i}]</span>
-							${this.renderMetadataTree(item, depth + 1)}
-						</div>
-					`).join('')}
-				</div>
-			`;
+			if (obj.length === 0) return '<span class="meta-empty">[]</span>';
+			return `<div class="meta-array">${obj.map((item, i) => `<div class="meta-array-item" style="padding-left: ${depth * 16}px"><span class="meta-index">[${i}]</span>${this.renderMetadataTree(item, depth + 1)}</div>`).join('')}</div>`;
 		}
-		
 		const keys = Object.keys(obj);
-		if (keys.length === 0) {
-			return '<span class="meta-empty">{}</span>';
-		}
-		
-		return `
-			<div class="meta-object">
-				${keys.map(key => `
-					<div class="meta-property" style="padding-left: ${depth * 16}px">
-						<span class="meta-key">${this.escapeHtml(key)}:</span>
-						${this.renderMetadataTree(obj[key], depth + 1)}
-					</div>
-				`).join('')}
-			</div>
-		`;
+		if (keys.length === 0) return '<span class="meta-empty">{}</span>';
+		return `<div class="meta-object">${keys.map(key => `<div class="meta-property" style="padding-left: ${depth * 16}px"><span class="meta-key">${this.escapeHtml(key)}:</span>${this.renderMetadataTree(obj[key], depth + 1)}</div>`).join('')}</div>`;
 	},
 	
-	/**
-	 * Show metadata editor modal
-	 */
 	showMetadataEditor() {
 		if (!this.currentNode) return;
-		
 		const modal = document.getElementById('metadataEditorModal');
 		const textarea = document.getElementById('metadataJsonEditor');
-		
 		if (modal && textarea) {
 			textarea.value = JSON.stringify(this.currentNode.metadata, null, 2);
 			document.getElementById('metadataEditorError').classList.add('hidden');
@@ -838,21 +706,15 @@ const App = {
 		}
 	},
 	
-	/**
-	 * Save metadata from editor
-	 */
 	async saveMetadata() {
 		if (!this.currentNode) return;
-		
 		const textarea = document.getElementById('metadataJsonEditor');
 		const errorDiv = document.getElementById('metadataEditorError');
 		
 		let metadata;
 		try {
 			metadata = JSON.parse(textarea.value);
-			if (typeof metadata !== 'object' || Array.isArray(metadata)) {
-				throw new Error('Metadata must be a JSON object');
-			}
+			if (typeof metadata !== 'object' || Array.isArray(metadata)) throw new Error('Metadata must be a JSON object');
 		} catch (e) {
 			errorDiv.textContent = `Invalid JSON: ${e.message}`;
 			errorDiv.classList.remove('hidden');
@@ -865,35 +727,24 @@ const App = {
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ metadata })
 			});
-			
 			if (!resp.ok) {
 				const data = await resp.json();
 				throw new Error(data.error || 'Failed to save metadata');
 			}
-			
 			document.getElementById('metadataEditorModal').classList.add('hidden');
 			await this.selectNode(this.currentNode.uuid);
-			await this.loadTree(); // Refresh tree in case name changed
+			await this.loadTree();
 		} catch (e) {
 			errorDiv.textContent = e.message;
 			errorDiv.classList.remove('hidden');
 		}
 	},
 	
-	/**
-	 * Close detail panel
-	 */
 	closeDetail() {
-		const panel = document.getElementById('detailPanel');
-		if (panel) {
-			panel.classList.add('hidden');
-		}
+		document.getElementById('detailPanel')?.classList.add('hidden');
 		this.currentNode = null;
 	},
 	
-	/**
-	 * Query by path
-	 */
 	queryPath(path) {
 		const input = document.getElementById('queryInput');
 		if (input) {
@@ -902,19 +753,12 @@ const App = {
 		}
 	},
 	
-	/**
-	 * Render a file card
-	 */
 	renderFileCard(file) {
 		const isImage = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'].includes(file.ext);
 		const isVideo = ['mp4', 'webm', 'mov'].includes(file.ext);
-		
 		let preview = `<span class="file-icon">📎</span>`;
-		if (isImage) {
-			preview = `<img src="/api/blobs/${file.hash}/thumbnail" alt="" loading="lazy" onerror="this.parentElement.innerHTML='<span class=file-icon>🖼️</span>'">`;
-		} else if (isVideo) {
-			preview = `<span class="file-icon">🎬</span>`;
-		}
+		if (isImage) preview = `<img src="/api/blobs/${file.hash}/thumbnail" alt="" loading="lazy" onerror="this.parentElement.innerHTML='<span class=file-icon>🖼️</span>'">`;
+		else if (isVideo) preview = `<span class="file-icon">🎬</span>`;
 		
 		return `
 			<div class="file-card" onclick="App.openFile('${file.hash}', '${file.ext}', '${this.escapeAttr(file.name)}')">
@@ -927,25 +771,14 @@ const App = {
 		`;
 	},
 	
-	/**
-	 * Open file in lightbox or download
-	 */
 	openFile(hash, ext, name) {
 		const isImage = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'].includes(ext);
 		const isVideo = ['mp4', 'webm', 'mov'].includes(ext);
-		
 		if (isImage || isVideo) {
 			const lightbox = document.getElementById('lightbox');
 			const content = document.getElementById('lightboxContent');
-			
 			const url = `/api/blobs/${hash}`;
-			
-			if (isImage) {
-				content.innerHTML = `<img src="${url}" alt="${this.escapeAttr(name)}">`;
-			} else {
-				content.innerHTML = `<video src="${url}" controls autoplay></video>`;
-			}
-			
+			content.innerHTML = isImage ? `<img src="${url}" alt="${this.escapeAttr(name)}">` : `<video src="${url}" controls autoplay></video>`;
 			lightbox.classList.remove('hidden');
 		} else {
 			const a = document.createElement('a');
@@ -955,9 +788,6 @@ const App = {
 		}
 	},
 	
-	/**
-	 * Close lightbox
-	 */
 	closeLightbox() {
 		const lightbox = document.getElementById('lightbox');
 		if (lightbox) {
@@ -966,9 +796,6 @@ const App = {
 		}
 	},
 	
-	/**
-	 * Show create node modal
-	 */
 	showCreateNode(type = 'RECORD') {
 		const modal = document.getElementById('createNodeModal');
 		if (modal) {
@@ -979,17 +806,10 @@ const App = {
 		}
 	},
 	
-	/**
-	 * Create a new node
-	 */
 	async createNode() {
 		const path = document.getElementById('createNodePath').value.trim();
 		const type = document.getElementById('createNodeType').value;
-		
-		if (!path) {
-			this.showError('Path is required');
-			return;
-		}
+		if (!path) { this.showError('Path is required'); return; }
 		
 		try {
 			const resp = await fetch('/api/nodes', {
@@ -997,12 +817,8 @@ const App = {
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ path, type })
 			});
-			
 			const data = await resp.json();
-			
-			if (!resp.ok) {
-				throw new Error(data.error || 'Failed to create node');
-			}
+			if (!resp.ok) throw new Error(data.error || 'Failed to create node');
 			
 			document.getElementById('createNodeModal').classList.add('hidden');
 			await this.loadTree();
@@ -1013,9 +829,6 @@ const App = {
 		}
 	},
 	
-	/**
-	 * Show add tag modal
-	 */
 	showAddTag() {
 		const modal = document.getElementById('addTagModal');
 		if (modal) {
@@ -1025,28 +838,18 @@ const App = {
 		}
 	},
 	
-	/**
-	 * Add a tag
-	 */
 	async addTag() {
 		const tag = document.getElementById('newTagInput').value.trim().toLowerCase();
-		
 		if (!tag || !this.currentNode) return;
 		
 		try {
 			const tags = [...this.currentNode.tags, tag];
-			
 			const resp = await fetch(`/api/nodes/${this.currentNode.uuid}`, {
 				method: 'PUT',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ tags })
 			});
-			
-			if (!resp.ok) {
-				const data = await resp.json();
-				throw new Error(data.error || 'Failed to add tag');
-			}
-			
+			if (!resp.ok) throw new Error((await resp.json()).error || 'Failed to add tag');
 			document.getElementById('addTagModal').classList.add('hidden');
 			await this.selectNode(this.currentNode.uuid);
 		} catch (e) {
@@ -1054,99 +857,54 @@ const App = {
 		}
 	},
 	
-	/**
-	 * Remove a tag
-	 */
 	async removeTag(tag) {
 		if (!this.currentNode) return;
-		
 		try {
 			const tags = this.currentNode.tags.filter(t => t !== tag);
-			
 			const resp = await fetch(`/api/nodes/${this.currentNode.uuid}`, {
 				method: 'PUT',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ tags })
 			});
-			
-			if (!resp.ok) {
-				const data = await resp.json();
-				throw new Error(data.error || 'Failed to remove tag');
-			}
-			
+			if (!resp.ok) throw new Error((await resp.json()).error || 'Failed to remove tag');
 			await this.selectNode(this.currentNode.uuid);
 		} catch (e) {
 			this.showError(e.message);
 		}
 	},
 	
-	/**
-	 * Show upload file modal
-	 */
 	showUploadFile() {
-		if (!this.currentNode) {
-			this.showError('Select a record first');
-			return;
-		}
-		
-		if (this.currentNode.type !== 'RECORD') {
-			this.showError('Can only upload files to records');
-			return;
-		}
+		if (!this.currentNode) { this.showError('Select a record first'); return; }
+		if (this.currentNode.type !== 'RECORD') { this.showError('Can only upload files to records'); return; }
 		
 		const input = document.createElement('input');
 		input.type = 'file';
 		input.multiple = true;
-		
 		input.addEventListener('change', async () => {
-			if (!input.files.length || !this.currentNode) return;
-			
+			if (!input.files.length) return;
 			for (const file of input.files) {
 				try {
 					const formData = new FormData();
 					formData.append('file', file);
-					
-					const resp = await fetch(`/api/nodes/${this.currentNode.uuid}/files`, {
-						method: 'POST',
-						body: formData
-					});
-					
-					if (!resp.ok) {
-						const data = await resp.json();
-						throw new Error(data.error || 'Upload failed');
-					}
+					const resp = await fetch(`/api/nodes/${this.currentNode.uuid}/files`, { method: 'POST', body: formData });
+					if (!resp.ok) throw new Error((await resp.json()).error || 'Upload failed');
 				} catch (e) {
 					this.showError(`Failed to upload ${file.name}: ${e.message}`);
 				}
 			}
-			
 			await this.loadTree();
 			await this.selectNode(this.currentNode.uuid);
 		});
-		
 		input.click();
 	},
 	
-	/**
-	 * Delete current node
-	 */
 	async deleteNode() {
 		if (!this.currentNode) return;
-		
-		if (!confirm(`Delete "${this.currentNode.name}" and all its contents?`)) {
-			return;
-		}
+		if (!confirm(`Delete "${this.currentNode.name}" and all its contents?`)) return;
 		
 		try {
-			const resp = await fetch(`/api/nodes/${this.currentNode.uuid}`, {
-				method: 'DELETE'
-			});
-			
-			if (!resp.ok) {
-				const data = await resp.json();
-				throw new Error(data.error || 'Failed to delete');
-			}
-			
+			const resp = await fetch(`/api/nodes/${this.currentNode.uuid}`, { method: 'DELETE' });
+			if (!resp.ok) throw new Error((await resp.json()).error || 'Failed to delete');
 			this.closeDetail();
 			await this.loadTree();
 			await this.executeQuery(document.getElementById('queryInput')?.value || '');
@@ -1155,27 +913,338 @@ const App = {
 		}
 	},
 	
-	/**
-	 * Export static site
-	 */
 	async exportStatic() {
 		try {
 			const resp = await fetch('/api/export', { method: 'POST' });
 			const data = await resp.json();
-			
-			if (!resp.ok) {
-				throw new Error(data.error || 'Export failed');
-			}
-			
+			if (!resp.ok) throw new Error(data.error || 'Export failed');
 			alert('Static site exported successfully to vault root.');
 		} catch (e) {
 			this.showError(e.message);
 		}
 	},
 	
-	/**
-	 * Format file size
-	 */
+	// ========== SETTINGS ==========
+	
+	async showSettingsModal() {
+		const modal = document.getElementById('settingsModal');
+		modal.classList.remove('hidden');
+		this.hideSettingsMessages();
+		this.hideChangePassword();
+		this.hideDisableEncryption();
+		
+		try {
+			const resp = await fetch('/api/settings');
+			const data = await resp.json();
+			
+			const statusDiv = document.getElementById('encryptionStatus');
+			const enableDiv = document.getElementById('encryptionEnable');
+			const manageDiv = document.getElementById('encryptionManage');
+			const partitionInput = document.getElementById('partitionSizeMb');
+			
+			if (data.encrypted) {
+				statusDiv.innerHTML = '<span class="status-badge encrypted">🔒 Encrypted</span>';
+				enableDiv.classList.add('hidden');
+				manageDiv.classList.remove('hidden');
+			} else {
+				statusDiv.innerHTML = '<span class="status-badge">🔓 Not Encrypted</span>';
+				enableDiv.classList.remove('hidden');
+				manageDiv.classList.add('hidden');
+			}
+			
+			partitionInput.value = data.partition_size_mb || 0;
+		} catch (e) {
+			this.showSettingsError(e.message);
+		}
+	},
+	
+	closeSettingsModal() {
+		document.getElementById('settingsModal').classList.add('hidden');
+	},
+	
+	hideSettingsMessages() {
+		document.getElementById('settingsError').classList.add('hidden');
+		document.getElementById('settingsSuccess').classList.add('hidden');
+	},
+	
+	showSettingsError(msg) {
+		const el = document.getElementById('settingsError');
+		el.textContent = msg;
+		el.classList.remove('hidden');
+	},
+	
+	showSettingsSuccess(msg) {
+		const el = document.getElementById('settingsSuccess');
+		el.textContent = msg;
+		el.classList.remove('hidden');
+	},
+	
+	async enableEncryption() {
+		this.hideSettingsMessages();
+		const pass = document.getElementById('enableEncryptionPassword').value;
+		const confirm = document.getElementById('enableEncryptionConfirm').value;
+		
+		if (!pass) { this.showSettingsError('Password is required'); return; }
+		if (pass !== confirm) { this.showSettingsError('Passwords do not match'); return; }
+		
+		try {
+			const resp = await fetch('/api/settings/encryption', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ action: 'enable', new_password: pass })
+			});
+			const data = await resp.json();
+			if (!resp.ok) throw new Error(data.error);
+			this.showSettingsSuccess(data.message);
+			setTimeout(() => this.showSettingsModal(), 1000);
+		} catch (e) {
+			this.showSettingsError(e.message);
+		}
+	},
+	
+	showChangePassword() {
+		document.getElementById('changePasswordForm').classList.remove('hidden');
+		document.getElementById('disableEncryptionForm').classList.add('hidden');
+	},
+	
+	hideChangePassword() {
+		document.getElementById('changePasswordForm').classList.add('hidden');
+		document.getElementById('currentPassword').value = '';
+		document.getElementById('newPassword').value = '';
+		document.getElementById('confirmNewPassword').value = '';
+	},
+	
+	async changePassword() {
+		this.hideSettingsMessages();
+		const current = document.getElementById('currentPassword').value;
+		const newPass = document.getElementById('newPassword').value;
+		const confirm = document.getElementById('confirmNewPassword').value;
+		
+		if (!current || !newPass) { this.showSettingsError('All fields are required'); return; }
+		if (newPass !== confirm) { this.showSettingsError('New passwords do not match'); return; }
+		
+		try {
+			const resp = await fetch('/api/settings/encryption', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ action: 'change_password', current_password: current, new_password: newPass })
+			});
+			const data = await resp.json();
+			if (!resp.ok) throw new Error(data.error);
+			this.showSettingsSuccess(data.message);
+			this.hideChangePassword();
+		} catch (e) {
+			this.showSettingsError(e.message);
+		}
+	},
+	
+	showDisableEncryption() {
+		document.getElementById('disableEncryptionForm').classList.remove('hidden');
+		document.getElementById('changePasswordForm').classList.add('hidden');
+	},
+	
+	hideDisableEncryption() {
+		document.getElementById('disableEncryptionForm').classList.add('hidden');
+		document.getElementById('disableEncryptionPassword').value = '';
+	},
+	
+	async disableEncryption() {
+		this.hideSettingsMessages();
+		const pass = document.getElementById('disableEncryptionPassword').value;
+		if (!pass) { this.showSettingsError('Password is required'); return; }
+		
+		if (!confirm('Are you sure you want to disable encryption? This will decrypt all files.')) return;
+		
+		try {
+			const resp = await fetch('/api/settings/encryption', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ action: 'disable', current_password: pass })
+			});
+			const data = await resp.json();
+			if (!resp.ok) throw new Error(data.error);
+			this.showSettingsSuccess(data.message);
+			setTimeout(() => this.showSettingsModal(), 1000);
+		} catch (e) {
+			this.showSettingsError(e.message);
+		}
+	},
+	
+	async updatePartitionSize() {
+		this.hideSettingsMessages();
+		const sizeMb = parseInt(document.getElementById('partitionSizeMb').value) || 0;
+		
+		if (sizeMb < 0) { this.showSettingsError('Size cannot be negative'); return; }
+		
+		try {
+			const resp = await fetch('/api/settings/partition', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ size_mb: sizeMb })
+			});
+			const data = await resp.json();
+			if (!resp.ok) throw new Error(data.error);
+			this.showSettingsSuccess(data.message);
+		} catch (e) {
+			this.showSettingsError(e.message);
+		}
+	},
+	
+	// ========== EXTRACTORS ==========
+	
+	async loadExtractors() {
+		try {
+			const resp = await fetch('/api/extractors');
+			const data = await resp.json();
+			this.extractors = data.extractors || [];
+			
+			const select = document.getElementById('extractorSelect');
+			if (select) {
+				this.extractors.forEach(ext => {
+					const option = document.createElement('option');
+					option.value = ext.slug;
+					option.textContent = ext.name;
+					select.appendChild(option);
+				});
+			}
+		} catch (e) {
+			console.error('Failed to load extractors:', e);
+		}
+	},
+	
+	showExtractorModal() {
+		const modal = document.getElementById('extractorModal');
+		document.getElementById('extractorError').classList.add('hidden');
+		document.getElementById('extractorSuccess').classList.add('hidden');
+		document.getElementById('extractorProgress').classList.add('hidden');
+		document.getElementById('extractorUrl').value = '';
+		document.getElementById('extractorSelect').value = '';
+		document.getElementById('extractorCookies').value = '';
+		document.getElementById('extractorConfigSection').classList.add('hidden');
+		document.getElementById('runExtractorBtn').disabled = false;
+		modal.classList.remove('hidden');
+	},
+	
+	closeExtractorModal() {
+		document.getElementById('extractorModal').classList.add('hidden');
+	},
+	
+	async loadExtractorConfig() {
+		const slug = document.getElementById('extractorSelect').value;
+		const configSection = document.getElementById('extractorConfigSection');
+		const configFields = document.getElementById('extractorConfigFields');
+		
+		if (!slug) {
+			configSection.classList.add('hidden');
+			return;
+		}
+		
+		try {
+			const resp = await fetch(`/api/extractors/${slug}/config`);
+			const data = await resp.json();
+			
+			if (data.config && Object.keys(data.config).length > 0) {
+				this.extractorConfigs[slug] = data.config;
+				configFields.innerHTML = '';
+				
+				for (const [key, value] of Object.entries(data.config)) {
+					const div = document.createElement('div');
+					div.className = 'form-group';
+					
+					let inputHtml = '';
+					if (typeof value === 'boolean') {
+						inputHtml = `<select id="extcfg_${key}" class="form-input"><option value="false">No</option><option value="true" ${value ? 'selected' : ''}>Yes</option></select>`;
+					} else if (typeof value === 'number') {
+						inputHtml = `<input type="number" id="extcfg_${key}" class="form-input" value="${value}">`;
+					} else if (Array.isArray(value)) {
+						inputHtml = `<input type="text" id="extcfg_${key}" class="form-input" value="${value.join(', ')}" placeholder="Comma-separated values">`;
+					} else {
+						inputHtml = `<input type="text" id="extcfg_${key}" class="form-input" value="${this.escapeAttr(value || '')}">`;
+					}
+					
+					div.innerHTML = `<label class="form-label">${this.escapeHtml(key)}</label>${inputHtml}`;
+					configFields.appendChild(div);
+				}
+				
+				configSection.classList.remove('hidden');
+			} else {
+				configSection.classList.add('hidden');
+			}
+		} catch (e) {
+			console.error('Failed to load extractor config:', e);
+		}
+	},
+	
+	async runExtractor() {
+		const url = document.getElementById('extractorUrl').value.trim();
+		const slug = document.getElementById('extractorSelect').value;
+		const cookies = document.getElementById('extractorCookies').value.trim();
+		
+		document.getElementById('extractorError').classList.add('hidden');
+		document.getElementById('extractorSuccess').classList.add('hidden');
+		
+		if (!url) {
+			document.getElementById('extractorError').textContent = 'URL is required';
+			document.getElementById('extractorError').classList.remove('hidden');
+			return;
+		}
+		
+		// Build config from form fields
+		const config = {};
+		const defaultConfig = this.extractorConfigs[slug] || {};
+		for (const key of Object.keys(defaultConfig)) {
+			const input = document.getElementById(`extcfg_${key}`);
+			if (input) {
+				let value = input.value;
+				if (typeof defaultConfig[key] === 'boolean') {
+					value = value === 'true';
+				} else if (typeof defaultConfig[key] === 'number') {
+					value = parseFloat(value) || 0;
+				} else if (Array.isArray(defaultConfig[key])) {
+					value = value.split(',').map(s => s.trim()).filter(s => s);
+				}
+				config[key] = value;
+			}
+		}
+		
+		document.getElementById('extractorProgress').classList.remove('hidden');
+		document.getElementById('runExtractorBtn').disabled = true;
+		
+		try {
+			const resp = await fetch('/api/extractors/run', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					url,
+					extractor: slug || undefined,
+					config,
+					cookies_path: cookies || undefined
+				})
+			});
+			
+			const data = await resp.json();
+			
+			if (!resp.ok) throw new Error(data.error);
+			
+			let msg = `Created ${data.nodes_created} nodes, added ${data.files_added} files.`;
+			if (data.errors?.length > 0) {
+				msg += ` ${data.errors.length} errors occurred.`;
+			}
+			
+			document.getElementById('extractorSuccess').textContent = msg;
+			document.getElementById('extractorSuccess').classList.remove('hidden');
+			
+			await this.loadTree();
+			await this.executeQuery('');
+		} catch (e) {
+			document.getElementById('extractorError').textContent = e.message;
+			document.getElementById('extractorError').classList.remove('hidden');
+		} finally {
+			document.getElementById('extractorProgress').classList.add('hidden');
+			document.getElementById('runExtractorBtn').disabled = false;
+		}
+	},
+	
 	formatSize(bytes) {
 		if (!bytes) return '0 B';
 		const k = 1024;
@@ -1184,9 +1253,6 @@ const App = {
 		return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
 	},
 	
-	/**
-	 * Escape HTML
-	 */
 	escapeHtml(str) {
 		if (str === null || str === undefined) return '';
 		const div = document.createElement('div');
@@ -1194,23 +1260,16 @@ const App = {
 		return div.innerHTML;
 	},
 	
-	/**
-	 * Escape for attribute
-	 */
 	escapeAttr(str) {
 		if (str === null || str === undefined) return '';
 		return String(str).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 	},
 	
-	/**
-	 * Show error message
-	 */
 	showError(message) {
 		alert('Error: ' + message);
 	}
 };
 
-// Initialize when DOM is ready
 document.addEventListener('DOMContentLoaded', () => {
 	if (document.getElementById('queryInput')) {
 		App.init();
