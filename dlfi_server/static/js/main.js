@@ -152,7 +152,7 @@ const App = {
 			const data = await resp.json();
 			
 			if (data.suggestions && data.suggestions.length > 0) {
-				this.showAutocomplete(data.suggestions);
+				this.showAutocomplete(data.suggestions, query, cursorPos);
 			} else {
 				this.hideAutocomplete();
 			}
@@ -161,11 +161,10 @@ const App = {
 		}
 	},
 	
-
 	/**
 	 * Show autocomplete dropdown
 	 */
-	showAutocomplete(suggestions) {
+	showAutocomplete(suggestions, query, cursorPos) {
 		const dropdown = document.getElementById('autocompleteDropdown');
 		if (!dropdown) return;
 		
@@ -173,6 +172,9 @@ const App = {
 			this.hideAutocomplete();
 			return;
 		}
+		
+		// Store context for insertion
+		this._autocompleteContext = this._getInsertionContext(query || '', cursorPos || 0);
 		
 		this.autocompleteIndex = 0;
 		
@@ -194,7 +196,8 @@ const App = {
 				html += `
 					<div class="autocomplete-item ${isActive}" 
 						data-index="${globalIndex}"
-						data-insert="${this.escapeAttr(item.insert_text || item.text)}">
+						data-insert="${this.escapeAttr(item.insert_text || item.text)}"
+						data-type="${this.escapeAttr(item.type)}">
 						<span class="autocomplete-text">${this.escapeHtml(item.display || item.text)}</span>
 						<span class="autocomplete-type">${this.escapeHtml(item.type)}</span>
 						${item.description ? `<span class="autocomplete-desc">${this.escapeHtml(item.description)}</span>` : ''}
@@ -212,7 +215,7 @@ const App = {
 			item.addEventListener('mousedown', (e) => {
 				e.preventDefault();
 				e.stopPropagation();
-				this.applyAutocomplete(item.dataset.insert);
+				this.applyAutocomplete(item.dataset.insert, item.dataset.type);
 			});
 			
 			item.addEventListener('mouseenter', () => {
@@ -221,6 +224,47 @@ const App = {
 				this.autocompleteIndex = parseInt(item.dataset.index);
 			});
 		});
+	},
+	
+	/**
+	 * Get insertion context - figure out what part of the query to replace
+	 */
+	_getInsertionContext(query, cursorPos) {
+		// Find token start
+		let tokenStart = cursorPos;
+		while (tokenStart > 0 && !/[\s|()]/.test(query[tokenStart - 1])) {
+			tokenStart--;
+		}
+		
+		const token = query.slice(tokenStart, cursorPos);
+		
+		// Check if token has an operator (: or =)
+		let operatorPos = -1;
+		for (const op of [':', '=']) {
+			const pos = token.indexOf(op);
+			if (pos !== -1) {
+				operatorPos = pos;
+				break;
+			}
+		}
+		
+		if (operatorPos !== -1) {
+			// We're after an operator, only replace the value part
+			return {
+				replaceStart: tokenStart + operatorPos + 1,
+				replaceEnd: cursorPos,
+				hasOperator: true,
+				prefix: token.slice(0, operatorPos + 1)
+			};
+		} else {
+			// Replace the whole token
+			return {
+				replaceStart: tokenStart,
+				replaceEnd: cursorPos,
+				hasOperator: false,
+				prefix: ''
+			};
+		}
 	},
 	
 	/**
@@ -233,6 +277,7 @@ const App = {
 			dropdown.innerHTML = '';
 		}
 		this.autocompleteIndex = -1;
+		this._autocompleteContext = null;
 	},
 	
 	/**
@@ -245,15 +290,12 @@ const App = {
 		const items = dropdown.querySelectorAll('.autocomplete-item');
 		if (!items.length) return;
 		
-		// Remove current active
 		items.forEach(item => item.classList.remove('active'));
 		
-		// Calculate new index
 		this.autocompleteIndex += direction;
 		if (this.autocompleteIndex < 0) this.autocompleteIndex = items.length - 1;
 		if (this.autocompleteIndex >= items.length) this.autocompleteIndex = 0;
 		
-		// Set new active
 		const activeItem = items[this.autocompleteIndex];
 		if (activeItem) {
 			activeItem.classList.add('active');
@@ -270,41 +312,53 @@ const App = {
 		
 		const active = dropdown.querySelector('.autocomplete-item.active');
 		if (active && active.dataset.insert) {
-			this.applyAutocomplete(active.dataset.insert);
+			this.applyAutocomplete(active.dataset.insert, active.dataset.type);
 		}
 	},
 	
 	/**
 	 * Apply autocomplete selection
 	 */
-	applyAutocomplete(insertText) {
+	applyAutocomplete(insertText, itemType) {
 		const input = document.getElementById('queryInput');
 		if (!input || !insertText) return;
 		
-		const cursorPos = input.selectionStart;
+		const ctx = this._autocompleteContext;
 		const value = input.value;
 		
-		// Find the start of the current token
-		let tokenStart = cursorPos;
-		while (tokenStart > 0 && !/[\s|()]/.test(value[tokenStart - 1])) {
-			tokenStart--;
+		let newValue;
+		let newPos;
+		
+		if (ctx && ctx.hasOperator) {
+			// Only replace the value part after the operator
+			// Check if insertText already includes the prefix (like "tag:value")
+			if (insertText.includes(':') || insertText.includes('=')) {
+				// Full replacement (like "tag:mytag" or "inside:path")
+				const tokenStart = ctx.replaceStart - ctx.prefix.length;
+				newValue = value.slice(0, tokenStart) + insertText + value.slice(ctx.replaceEnd);
+				newPos = tokenStart + insertText.length;
+			} else {
+				// Just the value part
+				newValue = value.slice(0, ctx.replaceStart) + insertText + value.slice(ctx.replaceEnd);
+				newPos = ctx.replaceStart + insertText.length;
+			}
+		} else if (ctx) {
+			// Replace whole token
+			newValue = value.slice(0, ctx.replaceStart) + insertText + value.slice(ctx.replaceEnd);
+			newPos = ctx.replaceStart + insertText.length;
+		} else {
+			// Fallback
+			newValue = insertText;
+			newPos = insertText.length;
 		}
 		
-		// Replace current token with insert text
-		const before = value.slice(0, tokenStart);
-		const after = value.slice(cursorPos);
-		const newValue = before + insertText + after;
-		
 		input.value = newValue;
-		
-		// Position cursor after inserted text
-		const newPos = tokenStart + insertText.length;
 		input.setSelectionRange(newPos, newPos);
 		input.focus();
 		
 		this.hideAutocomplete();
 		
-		// Fetch new suggestions if the insert ends with : or we might need more
+		// Fetch new suggestions if the insert ends with : or =
 		if (insertText.endsWith(':') || insertText.endsWith('=')) {
 			setTimeout(() => {
 				this.fetchAutocomplete(input.value, input.selectionStart);
@@ -392,19 +446,16 @@ const App = {
 		const node = this.treeNodes.find(n => n.uuid === uuid);
 		if (!node) return;
 		
-		// Update tree selection visually
 		document.querySelectorAll('.tree-item').forEach(el => {
 			el.classList.toggle('active', el.dataset.uuid === uuid);
 		});
 		
-		// Set query to inside:path and execute
 		const input = document.getElementById('queryInput');
 		if (input) {
 			input.value = `inside:${node.path}`;
 			this.executeQuery(input.value);
 		}
 		
-		// Also select the node for detail view
 		this.selectNode(uuid);
 	},
 	
@@ -538,7 +589,6 @@ const App = {
 	 * Select and display a node
 	 */
 	async selectNode(uuid) {
-		// Update tree selection
 		document.querySelectorAll('.tree-item').forEach(el => {
 			el.classList.toggle('active', el.dataset.uuid === uuid);
 		});
@@ -583,24 +633,39 @@ const App = {
 		
 		html += `<div class="detail-type-badge ${node.type.toLowerCase()}">${node.type}</div>`;
 		
-		// Metadata
-		if (Object.keys(node.metadata).length > 0) {
-			html += `
-				<div class="panel">
-					<div class="panel-header"><span class="panel-title">Metadata</span></div>
-					<div class="panel-body">
-						<div class="meta-grid">
-							${Object.entries(node.metadata).map(([k, v]) => `
-								<div class="meta-item">
-									<div class="meta-label">${this.escapeHtml(k)}</div>
-									<div class="meta-value">${this.escapeHtml(typeof v === 'object' ? JSON.stringify(v) : String(v))}</div>
-								</div>
-							`).join('')}
-						</div>
+		// Hero preview for first file (if image/video)
+		if (node.files && node.files.length > 0) {
+			const firstFile = node.files[0];
+			const isImage = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'].includes(firstFile.ext);
+			const isVideo = ['mp4', 'webm', 'mov'].includes(firstFile.ext);
+			
+			if (isImage || isVideo) {
+				html += `
+					<div class="hero-preview" onclick="App.openFile('${firstFile.hash}', '${firstFile.ext}', '${this.escapeAttr(firstFile.name)}')">
+						${isImage 
+							? `<img src="/api/blobs/${firstFile.hash}" alt="${this.escapeAttr(firstFile.name)}" loading="lazy">`
+							: `<video src="/api/blobs/${firstFile.hash}" controls></video>`
+						}
 					</div>
-				</div>
-			`;
+				`;
+			}
 		}
+		
+		// Metadata
+		html += `
+			<div class="panel">
+				<div class="panel-header">
+					<span class="panel-title">Metadata</span>
+					<button class="btn btn-sm btn-secondary" onclick="App.showMetadataEditor()">Edit</button>
+				</div>
+				<div class="panel-body">
+					${Object.keys(node.metadata).length > 0 
+						? `<div class="meta-tree">${this.renderMetadataTree(node.metadata)}</div>`
+						: '<p class="text-muted">No metadata</p>'
+					}
+				</div>
+			</div>
+		`;
 		
 		// Tags
 		html += `
@@ -644,8 +709,12 @@ const App = {
 			`;
 		}
 		
-		// Files
+		// Files (excluding first if shown as hero)
 		if (node.files && node.files.length > 0) {
+			const firstFile = node.files[0];
+			const isFirstPreviewable = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'mp4', 'webm', 'mov'].includes(firstFile.ext);
+			const filesToShow = isFirstPreviewable ? node.files.slice(1) : node.files;
+			
 			html += `
 				<div class="panel">
 					<div class="panel-header">
@@ -653,9 +722,11 @@ const App = {
 						<button class="btn btn-sm btn-secondary" onclick="App.showUploadFile()">Upload</button>
 					</div>
 					<div class="panel-body">
-						<div class="files-grid files-grid-small">
-							${node.files.map(f => this.renderFileCard(f)).join('')}
-						</div>
+						${filesToShow.length > 0 ? `
+							<div class="files-grid">
+								${filesToShow.map(f => this.renderFileCard(f)).join('')}
+							</div>
+						` : (isFirstPreviewable ? '<p class="text-muted">No additional files</p>' : '')}
 					</div>
 				</div>
 			`;
@@ -695,6 +766,117 @@ const App = {
 		
 		if (body) {
 			body.innerHTML = html;
+		}
+	},
+	
+	/**
+	 * Render metadata as a tree (supports nested objects/arrays)
+	 */
+	renderMetadataTree(obj, depth = 0) {
+		if (obj === null || obj === undefined) {
+			return '<span class="meta-null">null</span>';
+		}
+		
+		if (typeof obj !== 'object') {
+			if (typeof obj === 'string') {
+				return `<span class="meta-string">"${this.escapeHtml(obj)}"</span>`;
+			} else if (typeof obj === 'number') {
+				return `<span class="meta-number">${obj}</span>`;
+			} else if (typeof obj === 'boolean') {
+				return `<span class="meta-boolean">${obj}</span>`;
+			}
+			return `<span class="meta-value">${this.escapeHtml(String(obj))}</span>`;
+		}
+		
+		if (Array.isArray(obj)) {
+			if (obj.length === 0) {
+				return '<span class="meta-empty">[]</span>';
+			}
+			return `
+				<div class="meta-array">
+					${obj.map((item, i) => `
+						<div class="meta-array-item" style="padding-left: ${depth * 16}px">
+							<span class="meta-index">[${i}]</span>
+							${this.renderMetadataTree(item, depth + 1)}
+						</div>
+					`).join('')}
+				</div>
+			`;
+		}
+		
+		const keys = Object.keys(obj);
+		if (keys.length === 0) {
+			return '<span class="meta-empty">{}</span>';
+		}
+		
+		return `
+			<div class="meta-object">
+				${keys.map(key => `
+					<div class="meta-property" style="padding-left: ${depth * 16}px">
+						<span class="meta-key">${this.escapeHtml(key)}:</span>
+						${this.renderMetadataTree(obj[key], depth + 1)}
+					</div>
+				`).join('')}
+			</div>
+		`;
+	},
+	
+	/**
+	 * Show metadata editor modal
+	 */
+	showMetadataEditor() {
+		if (!this.currentNode) return;
+		
+		const modal = document.getElementById('metadataEditorModal');
+		const textarea = document.getElementById('metadataJsonEditor');
+		
+		if (modal && textarea) {
+			textarea.value = JSON.stringify(this.currentNode.metadata, null, 2);
+			document.getElementById('metadataEditorError').classList.add('hidden');
+			modal.classList.remove('hidden');
+			textarea.focus();
+		}
+	},
+	
+	/**
+	 * Save metadata from editor
+	 */
+	async saveMetadata() {
+		if (!this.currentNode) return;
+		
+		const textarea = document.getElementById('metadataJsonEditor');
+		const errorDiv = document.getElementById('metadataEditorError');
+		
+		let metadata;
+		try {
+			metadata = JSON.parse(textarea.value);
+			if (typeof metadata !== 'object' || Array.isArray(metadata)) {
+				throw new Error('Metadata must be a JSON object');
+			}
+		} catch (e) {
+			errorDiv.textContent = `Invalid JSON: ${e.message}`;
+			errorDiv.classList.remove('hidden');
+			return;
+		}
+		
+		try {
+			const resp = await fetch(`/api/nodes/${this.currentNode.uuid}`, {
+				method: 'PUT',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ metadata })
+			});
+			
+			if (!resp.ok) {
+				const data = await resp.json();
+				throw new Error(data.error || 'Failed to save metadata');
+			}
+			
+			document.getElementById('metadataEditorModal').classList.add('hidden');
+			await this.selectNode(this.currentNode.uuid);
+			await this.loadTree(); // Refresh tree in case name changed
+		} catch (e) {
+			errorDiv.textContent = e.message;
+			errorDiv.classList.remove('hidden');
 		}
 	},
 	
@@ -907,6 +1089,11 @@ const App = {
 			return;
 		}
 		
+		if (this.currentNode.type !== 'RECORD') {
+			this.showError('Can only upload files to records');
+			return;
+		}
+		
 		const input = document.createElement('input');
 		input.type = 'file';
 		input.multiple = true;
@@ -933,6 +1120,7 @@ const App = {
 				}
 			}
 			
+			await this.loadTree();
 			await this.selectNode(this.currentNode.uuid);
 		});
 		

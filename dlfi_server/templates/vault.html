@@ -133,6 +133,24 @@
 		</div>
 	</div>
 </div>
+
+<!-- Metadata Editor Modal -->
+<div id="metadataEditorModal" class="modal-overlay hidden">
+    <div class="modal modal-lg">
+        <div class="modal-header">
+            <h2 class="modal-title">Edit Metadata</h2>
+        </div>
+        <div class="modal-body">
+            <p class="form-hint mb-3">Edit the JSON metadata. Supports nested objects and arrays.</p>
+            <div id="metadataEditorError" class="alert alert-error hidden mb-3"></div>
+            <textarea id="metadataJsonEditor" class="form-input metadata-editor" spellcheck="false"></textarea>
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-secondary" onclick="document.getElementById('metadataEditorModal').classList.add('hidden')">Cancel</button>
+            <button class="btn btn-primary" onclick="App.saveMetadata()">Save</button>
+        </div>
+    </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
