@@ -44,12 +44,20 @@ class DLFI:
 			if not self.config.salt:
 				raise ValueError("Encrypted vault missing salt in config")
 			self.crypto = VaultCrypto.from_salt_b64(password, self.config.salt)
+			
+			try:
+				if self.crypto.decrypt_string(self.config.check_value) == VaultConfigManager.VERIFICATION_STRING:
+					pass
+			except Exception as e:
+				raise ValueError(f"Encrypted vault wrong password: {e}")
 		else:
 			self.crypto = VaultCrypto(password=password) if password else VaultCrypto()
 			if password and not self.config.encrypted:
 				# New vault with password - enable encryption
 				self.config.encrypted = True
 				self.config.salt = self.crypto.get_salt_b64()
+				# Create verification token for new encrypted vault
+				self.config.check_value = self.crypto.encrypt_string(VaultConfigManager.VERIFICATION_STRING)
 				self.config.save(self.config_path)
 		
 		# Initialize partitioner

@@ -6,6 +6,7 @@ from typing import Optional
 from flask import Blueprint, request, jsonify, current_app, Response
 from io import BytesIO
 from dlfi_server.query import QueryParser, QueryExecutor, AutocompleteProvider, ParseError
+from dlfi.config import VaultConfigManager
 
 logger = logging.getLogger(__name__)
 
@@ -32,13 +33,25 @@ def require_vault(f):
 
 def verify_vault_password(dlfi) -> bool:
 	"""
-	Verify the password is correct by attempting to decrypt something.
-	Returns True if password is valid or vault is not encrypted.
+	Verify the password is correct.
+	Priority:
+	1. Check 'check_value' in config (fast, robust for empty vaults).
+	2. Fallback: Try decrypting a blob (legacy vaults).
+	3. Fallback: Try decrypting manifest (legacy vaults).
 	"""
 	if not dlfi.config.encrypted:
 		return True
 	
-	# Try to find a blob to decrypt
+	# 1. Check Verification Token (New standard)
+	if dlfi.config.check_value:
+		try:
+			decrypted = dlfi.crypto.decrypt_string(dlfi.config.check_value)
+			return decrypted == VaultConfigManager.VERIFICATION_STRING
+		except Exception as e:
+			logger.debug(f"Config check_value verification failed: {e}")
+			return False
+
+	# 2. Try to find a blob to decrypt (Legacy fallback)
 	cursor = dlfi.conn.execute("SELECT hash FROM blobs LIMIT 1")
 	row = cursor.fetchone()
 	
@@ -48,10 +61,10 @@ def verify_vault_password(dlfi) -> bool:
 			data = dlfi.read_blob(row[0])
 			return data is not None
 		except Exception as e:
-			logger.debug(f"Password verification failed: {e}")
+			logger.debug(f"Blob verification failed: {e}")
 			return False
 	
-	# No blobs to verify against - check if there's an encrypted manifest
+	# 3. Check for encrypted manifest (Legacy fallback)
 	manifest_path = dlfi.root / "manifest.json"
 	if manifest_path.exists() and dlfi.crypto.enabled:
 		try:
@@ -64,7 +77,8 @@ def verify_vault_password(dlfi) -> bool:
 			logger.debug(f"Manifest decryption failed: {e}")
 			return False
 	
-	# Nothing to verify against - assume correct (new empty vault)
+	# If we are here, it's an empty encrypted vault with no check_value (Legacy empty vault).
+	# We assume success to allow opening, but this is the security gap the new system fixes for new vaults.
 	return True
 
 
@@ -124,7 +138,7 @@ def open_vault():
 	try:
 		dlfi = DLFI(str(vault_path), password=password)
 		
-		# Verify password is correct by trying to decrypt something
+		# Verify password is correct
 		if dlfi.config.encrypted:
 			if not verify_vault_password(dlfi):
 				dlfi.close()

@@ -1,7 +1,9 @@
 import json
+from dlfi.partition import FilePartitioner
 from pathlib import Path
 from typing import Optional
 from dataclasses import dataclass, asdict
+import dlfi
 import logging
 import os
 
@@ -13,6 +15,7 @@ class VaultConfig:
 	"""Configuration for a DLFI vault."""
 	encrypted: bool = False
 	salt: Optional[str] = None  # Base64 encoded encryption salt
+	check_value: Optional[str] = None  # Encrypted verification string
 	partition_size: int = 50 * 1024 * 1024  # 50MB default, 0 = disabled
 	version: int = 2  # Schema version for future migrations
 	
@@ -61,7 +64,9 @@ class VaultConfig:
 class VaultConfigManager:
 	"""Manages vault configuration changes including re-encryption and re-partitioning."""
 	
-	def __init__(self, dlfi_instance):
+	VERIFICATION_STRING = "DLFI_VERIFICATION"
+	
+	def __init__(self, dlfi_instance: 'dlfi.core.DLFI'):
 		self.dlfi = dlfi_instance
 	
 	def _get_all_blob_hashes(self) -> list:
@@ -85,7 +90,7 @@ class VaultConfigManager:
 		
 		return bytes(data)
 	
-	def _write_blob_raw(self, file_hash: str, data: bytes, partitioner) -> int:
+	def _write_blob_raw(self, file_hash: str, data: bytes, partitioner: FilePartitioner) -> int:
 		"""
 		Write raw blob data to storage with given partitioner.
 		Returns the number of parts written.
@@ -171,6 +176,7 @@ class VaultConfigManager:
 		# Update config
 		self.dlfi.config.encrypted = True
 		self.dlfi.config.salt = new_crypto.get_salt_b64()
+		self.dlfi.config.check_value = new_crypto.encrypt_string(self.VERIFICATION_STRING)
 		self.dlfi.config.save(self.dlfi.config_path)
 		
 		# Update instance
@@ -197,6 +203,14 @@ class VaultConfigManager:
 		# Verify password by creating crypto instance
 		try:
 			old_crypto = VaultCrypto.from_salt_b64(current_password, self.dlfi.config.salt)
+			# Verify check value if it exists
+			if self.dlfi.config.check_value:
+				try:
+					decrypted_check = old_crypto.decrypt_string(self.dlfi.config.check_value)
+					if decrypted_check != self.VERIFICATION_STRING:
+						raise ValueError("Incorrect password")
+				except Exception:
+					raise ValueError("Incorrect password")
 		except Exception as e:
 			logger.error(f"Failed to initialize decryption: {e}")
 			return False
@@ -239,6 +253,7 @@ class VaultConfigManager:
 		# Update config
 		self.dlfi.config.encrypted = False
 		self.dlfi.config.salt = None
+		self.dlfi.config.check_value = None
 		self.dlfi.config.save(self.dlfi.config_path)
 		
 		# Update instance
@@ -265,6 +280,14 @@ class VaultConfigManager:
 		# Verify old password
 		try:
 			old_crypto = VaultCrypto.from_salt_b64(old_password, self.dlfi.config.salt)
+			# Verify check value if it exists
+			if self.dlfi.config.check_value:
+				try:
+					decrypted_check = old_crypto.decrypt_string(self.dlfi.config.check_value)
+					if decrypted_check != self.VERIFICATION_STRING:
+						raise ValueError("Incorrect password")
+				except Exception:
+					raise ValueError("Incorrect password")
 		except Exception as e:
 			logger.error(f"Failed to verify old password: {e}")
 			return False
@@ -310,8 +333,9 @@ class VaultConfigManager:
 					logger.error(f"Failed to re-encrypt blob {file_hash[:8]}: {e}")
 					raise
 		
-		# Update config with new salt
+		# Update config with new salt and new check value
 		self.dlfi.config.salt = new_crypto.get_salt_b64()
+		self.dlfi.config.check_value = new_crypto.encrypt_string(self.VERIFICATION_STRING)
 		self.dlfi.config.save(self.dlfi.config_path)
 		
 		# Update instance
