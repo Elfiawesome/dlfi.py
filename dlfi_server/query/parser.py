@@ -511,8 +511,12 @@ class QueryParser:
 		"""Parse the value part of a key:value expression."""
 		key_lower = key.lower()
 		
-		# Determine term type based on key
-		term_type = self.RESERVED_KEYS.get(key_lower, TermType.METADATA)
+		# Check if key contains dots (nested path like meta.artist.name)
+		# Only treat as reserved keyword if it's a simple key
+		if '.' not in key_lower:
+			term_type = self.RESERVED_KEYS.get(key_lower, TermType.METADATA)
+		else:
+			term_type = TermType.METADATA
 		
 		# Parse the value
 		value = self._read_value()
@@ -531,6 +535,7 @@ class QueryParser:
 			if value_end:
 				value_end = self._parse_size(value_end)
 		
+		# For metadata, keep the original key (with dots for nested paths)
 		return Term(
 			type=term_type,
 			key=key if term_type == TermType.METADATA else None,

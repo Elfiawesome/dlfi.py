@@ -289,11 +289,15 @@ class QueryExecutor:
 			return "t.tag LIKE ?", [f"%{value.lower()}%"]
 	
 	def _build_metadata_condition(self, term: Term) -> Tuple[str, List[Any]]:
-		"""Build metadata field search condition."""
+		"""Build metadata field search condition. Supports nested paths like 'artist.name'."""
 		key = term.key
 		value = term.value
 		
-		json_path = f"$.{key}"
+		# Convert dot notation to JSON path: artist.name -> $.artist.name
+		if '.' in key:
+			json_path = '$.' + key
+		else:
+			json_path = f"$.{key}"
 		
 		if term.operator == Operator.EQUALS:
 			return f"json_extract(n.metadata, ?) = ?", [json_path, value]
@@ -322,9 +326,14 @@ class QueryExecutor:
 		return "", []
 	
 	def _build_meta_exists_condition(self, term: Term) -> Tuple[str, List[Any]]:
-		"""Build metadata existence check condition."""
+		"""Build metadata existence check condition. Supports nested paths."""
 		key = term.key
-		json_path = f"$.{key}"
+		
+		# Convert dot notation to JSON path
+		if '.' in key:
+			json_path = '$.' + key
+		else:
+			json_path = f"$.{key}"
 		
 		if term.operator == Operator.NOT_EXISTS:
 			return f"json_extract(n.metadata, ?) IS NULL", [json_path]

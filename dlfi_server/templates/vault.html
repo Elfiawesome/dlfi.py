@@ -286,6 +286,107 @@
 		</div>
 	</div>
 </div>
+
+<!-- Add Relationship Modal -->
+<div id="addRelationshipModal" class="modal-overlay hidden">
+	<div class="modal">
+		<div class="modal-header">
+			<h2 class="modal-title">Add Relationship</h2>
+		</div>
+		<div class="modal-body">
+			<div id="addRelError" class="alert alert-error hidden mb-3"></div>
+			<div class="form-group">
+				<label class="form-label">Relationship Type</label>
+				<input type="text" id="relationType" class="form-input" placeholder="e.g., AUTHORED_BY" list="relationTypesList">
+				<datalist id="relationTypesList"></datalist>
+			</div>
+			<div class="form-group">
+				<label class="form-label">Target Path</label>
+				<input type="text" id="relationTarget" class="form-input" placeholder="path/to/target" list="relationTargetsList">
+				<datalist id="relationTargetsList"></datalist>
+			</div>
+		</div>
+		<div class="modal-footer">
+			<button class="btn btn-secondary" onclick="App.closeAddRelationshipModal()">Cancel</button>
+			<button class="btn btn-primary" onclick="App.addRelationship()">Add Relationship</button>
+		</div>
+	</div>
+</div>
+
+<!-- Context Menu -->
+<div id="contextMenu" class="context-menu hidden">
+	<div class="context-menu-item" onclick="App.contextAction('open')">Open</div>
+	<div class="context-menu-item" onclick="App.contextAction('addTag')">Add Tag</div>
+	<div class="context-menu-item" onclick="App.contextAction('addRelationship')">Add Relationship</div>
+	<div class="context-menu-divider"></div>
+	<div class="context-menu-item" onclick="App.contextAction('delete')">Delete</div>
+</div>
+
+<!-- Bulk Edit Modal -->
+<div id="bulkEditModal" class="modal-overlay hidden">
+	<div class="modal modal-lg">
+		<div class="modal-header">
+			<h2 class="modal-title">Bulk Edit (<span id="bulkEditCount">0</span> items)</h2>
+		</div>
+		<div class="modal-body">
+			<div id="bulkEditError" class="alert alert-error hidden mb-3"></div>
+			<div id="bulkEditSuccess" class="alert alert-success hidden mb-3"></div>
+			
+			<!-- Bulk Add Tags -->
+			<div class="bulk-section">
+				<h3 class="bulk-section-title">Add Tags</h3>
+				<div class="form-group">
+					<input type="text" id="bulkAddTagsInput" class="form-input" placeholder="tag1, tag2, tag3">
+					<button class="btn btn-primary mt-2" onclick="App.bulkAddTags()">Add Tags to All</button>
+				</div>
+			</div>
+			
+			<!-- Bulk Remove Tags -->
+			<div class="bulk-section">
+				<h3 class="bulk-section-title">Remove Tags</h3>
+				<div class="form-group">
+					<input type="text" id="bulkRemoveTagsInput" class="form-input" placeholder="tag1, tag2, tag3">
+					<button class="btn btn-secondary mt-2" onclick="App.bulkRemoveTags()">Remove Tags from All</button>
+				</div>
+			</div>
+			
+			<!-- Bulk Add Relationship -->
+			<div class="bulk-section">
+				<h3 class="bulk-section-title">Add Relationship</h3>
+				<div class="form-group">
+					<label class="form-label">Relationship Type</label>
+					<input type="text" id="bulkRelationType" class="form-input" placeholder="e.g., PART_OF" list="bulkRelationTypesList">
+					<datalist id="bulkRelationTypesList"></datalist>
+				</div>
+				<div class="form-group">
+					<label class="form-label">Target Path</label>
+					<input type="text" id="bulkRelationTarget" class="form-input" placeholder="path/to/target" list="bulkRelationTargetsList">
+					<datalist id="bulkRelationTargetsList"></datalist>
+				</div>
+				<button class="btn btn-primary" onclick="App.bulkAddRelationship()">Add Relationship to All</button>
+			</div>
+			
+			<!-- Bulk Add Metadata -->
+			<div class="bulk-section">
+				<h3 class="bulk-section-title">Merge Metadata</h3>
+				<div class="form-group">
+					<textarea id="bulkMetadataInput" class="form-input metadata-editor-small" placeholder='{"key": "value"}'></textarea>
+					<button class="btn btn-primary mt-2" onclick="App.bulkAddMetadata()">Merge Metadata to All</button>
+				</div>
+			</div>
+			
+			<!-- Bulk Delete -->
+			<div class="bulk-section bulk-section-danger">
+				<h3 class="bulk-section-title">Delete All Selected</h3>
+				<button class="btn btn-danger" onclick="App.bulkDelete()">Delete Selected Items</button>
+			</div>
+		</div>
+		<div class="modal-footer">
+			<button class="btn btn-secondary" onclick="App.closeBulkEditModal()">Close</button>
+		</div>
+	</div>
+</div>
+
 {% endblock %}
 
 {% block scripts %}

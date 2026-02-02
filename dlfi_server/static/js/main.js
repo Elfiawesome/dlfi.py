@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * DLFI Server - Frontend Application with Query System
  */
@@ -13,12 +14,17 @@ const App = {
 	extractors: [],
 	extractorConfigs: {},
 	
+	// Multi-select
+	selectedNodes: new Set(),
+	isShiftHeld: false,
+	
 	/**
 	 * Initialize the application
 	 */
 	async init() {
 		this.bindEvents();
 		this.initQueryInput();
+		this.initMultiSelect();
 		await Promise.all([
 			this.loadTree(),
 			this.executeQuery(''),
@@ -441,8 +447,13 @@ const App = {
 			preview = `<div class="gallery-preview gallery-no-preview"><span class="gallery-icon">${icon}</span></div>`;
 		}
 		
+		const isSelected = this.selectedNodes.has(node.uuid) ? 'selected' : '';
+		
 		return `
-			<div class="gallery-item" onclick="App.selectNode('${node.uuid}')">
+			<div class="gallery-item ${isSelected}" 
+				data-uuid="${node.uuid}"
+				onclick="App.handleItemClick('${node.uuid}', this, event)"
+				oncontextmenu="App.handleItemContextMenu('${node.uuid}', this, event)">
 				${preview}
 				<div class="gallery-info">
 					<div class="gallery-name" title="${this.escapeAttr(node.name)}">${this.escapeHtml(node.name)}</div>
@@ -483,9 +494,13 @@ const App = {
 		const icon = node.type === 'VAULT' ? '📁' : '📄';
 		const tags = node.tags.slice(0, 3).map(t => `<span class="result-tag">${this.escapeHtml(t)}</span>`).join('');
 		const moreTags = node.tags.length > 3 ? `<span class="result-tag-more">+${node.tags.length - 3}</span>` : '';
+		const isSelected = this.selectedNodes.has(node.uuid) ? 'selected' : '';
 		
 		return `
-			<div class="result-item" onclick="App.selectNode('${node.uuid}')">
+			<div class="result-item ${isSelected}"
+				data-uuid="${node.uuid}"
+				onclick="App.handleItemClick('${node.uuid}', this, event)"
+				oncontextmenu="App.handleItemContextMenu('${node.uuid}', this, event)">
 				<div class="result-icon">${icon}</div>
 				<div class="result-content">
 					<div class="result-name">${this.escapeHtml(node.name)}</div>
@@ -544,7 +559,7 @@ const App = {
 		}
 	},
 	
-	renderNodeDetail(node) {
+	async renderNodeDetail(node) {
 		const panel = document.getElementById('detailPanel');
 		if (!panel) return;
 		panel.classList.remove('hidden');
@@ -561,6 +576,15 @@ const App = {
 					<button class="btn btn-sm btn-danger" onclick="App.deleteNode()">Delete</button>
 				</div>
 			`;
+		}
+		
+		// Fetch relationship data
+		let relData = { outgoing: [], incoming: [] };
+		try {
+			const relResp = await fetch(`/api/nodes/${node.uuid}/relationships`);
+			relData = await relResp.json();
+		} catch (e) {
+			console.error('Failed to load relationships:', e);
 		}
 		
 		let html = `<div class="detail-type-badge ${node.type.toLowerCase()}">${node.type}</div>`;
@@ -606,24 +630,55 @@ const App = {
 		`;
 		
 		// Relationships
-		if (node.relationships?.length > 0) {
-			html += `
-				<div class="panel">
-					<div class="panel-header"><span class="panel-title">Relationships</span></div>
-					<div class="panel-body">
-						<div class="rel-list">
-							${node.relationships.map(r => `
-								<div class="rel-item">
-									<span class="rel-type">${this.escapeHtml(r.relation)}</span>
-									<span class="rel-arrow">→</span>
-									<span class="rel-target" onclick="App.queryPath('${this.escapeAttr(r.target_path)}')">${this.escapeHtml(r.target_path)}</span>
-								</div>
-							`).join('')}
+		html += `
+			<div class="panel">
+				<div class="panel-header">
+					<span class="panel-title">Relationships</span>
+					<button class="btn btn-sm btn-secondary" onclick="App.showAddRelationshipModal()">Add</button>
+				</div>
+				<div class="panel-body">
+		`;
+		
+		if (relData.outgoing?.length > 0) {
+			html += `<div class="rel-section-title">Outgoing</div><div class="rel-list">`;
+			for (const r of relData.outgoing) {
+				html += `
+					<div class="rel-item">
+						<span class="rel-type">${this.escapeHtml(r.relation)}</span>
+						<span class="rel-arrow">→</span>
+						<span class="rel-target" onclick="App.queryPath('${this.escapeAttr(r.target_path)}')">${this.escapeHtml(r.target_path)}</span>
+						<div class="rel-actions">
+							<button class="rel-remove" onclick="App.removeRelationship('${r.target_uuid}', '${this.escapeAttr(r.relation)}', 'outgoing')" title="Remove">×</button>
 						</div>
 					</div>
-				</div>
-			`;
+				`;
+			}
+			html += `</div>`;
 		}
+		
+		if (relData.incoming?.length > 0) {
+			html += `<div class="rel-section-title">Incoming</div><div class="rel-list">`;
+			for (const r of relData.incoming) {
+				html += `
+					<div class="rel-item">
+						<span class="rel-target" onclick="App.queryPath('${this.escapeAttr(r.source_path)}')">${this.escapeHtml(r.source_path)}</span>
+						<span class="rel-arrow">→</span>
+						<span class="rel-type">${this.escapeHtml(r.relation)}</span>
+						<span class="rel-direction">(incoming)</span>
+						<div class="rel-actions">
+							<button class="rel-remove" onclick="App.removeRelationship('${r.source_uuid}', '${this.escapeAttr(r.relation)}', 'incoming')" title="Remove">×</button>
+						</div>
+					</div>
+				`;
+			}
+			html += `</div>`;
+		}
+		
+		if (!relData.outgoing?.length && !relData.incoming?.length) {
+			html += `<p class="text-muted">No relationships</p>`;
+		}
+		
+		html += `</div></div>`;
 		
 		// Files
 		if (node.files?.length > 0) {
@@ -1267,7 +1322,406 @@ const App = {
 	
 	showError(message) {
 		alert('Error: ' + message);
-	}
+	},
+
+	// ========== MULTI-SELECT ==========
+
+	initMultiSelect() {
+		document.addEventListener('keydown', (e) => {
+			if (e.key === 'Shift') this.isShiftHeld = true;
+		});
+		document.addEventListener('keyup', (e) => {
+			if (e.key === 'Shift') this.isShiftHeld = false;
+		});
+		
+		// Hide context menu on click elsewhere
+		document.addEventListener('click', (e) => {
+			if (!e.target.closest('.context-menu')) {
+				this.hideContextMenu();
+			}
+		});
+	},
+
+	toggleSelection(uuid, element) {
+		if (this.selectedNodes.has(uuid)) {
+			this.selectedNodes.delete(uuid);
+			element.classList.remove('selected');
+		} else {
+			this.selectedNodes.add(uuid);
+			element.classList.add('selected');
+		}
+		this.updateSelectionBar();
+	},
+
+	clearSelection() {
+		this.selectedNodes.clear();
+		document.querySelectorAll('.selected').forEach(el => el.classList.remove('selected'));
+		this.updateSelectionBar();
+	},
+
+	updateSelectionBar() {
+		let bar = document.getElementById('selectionBar');
+		
+		if (this.selectedNodes.size === 0) {
+			if (bar) bar.remove();
+			return;
+		}
+		
+		if (!bar) {
+			bar = document.createElement('div');
+			bar.id = 'selectionBar';
+			bar.className = 'selection-bar';
+			document.body.appendChild(bar);
+		}
+		
+		bar.innerHTML = `
+			<span class="selection-count">${this.selectedNodes.size} selected</span>
+			<div class="selection-actions">
+				<button class="btn btn-sm btn-primary" onclick="App.showBulkEditModal()">Edit Selected</button>
+				<button class="btn btn-sm btn-secondary" onclick="App.clearSelection()">Clear</button>
+			</div>
+		`;
+	},
+
+	handleItemClick(uuid, element, event) {
+		if (this.isShiftHeld) {
+			event.preventDefault();
+			event.stopPropagation();
+			this.toggleSelection(uuid, element);
+		} else if (this.selectedNodes.size > 0) {
+			// If there's a selection and not shift-clicking, clear it
+			this.clearSelection();
+			this.selectNode(uuid);
+		} else {
+			this.selectNode(uuid);
+		}
+	},
+
+	handleItemContextMenu(uuid, element, event) {
+		event.preventDefault();
+		event.stopPropagation();
+		
+		// If right-clicking on a non-selected item, select only it
+		if (!this.selectedNodes.has(uuid)) {
+			this.clearSelection();
+			this.selectedNodes.add(uuid);
+			element.classList.add('selected');
+			this.updateSelectionBar();
+		}
+		
+		this.showContextMenu(event.clientX, event.clientY);
+	},
+
+	showContextMenu(x, y) {
+		const menu = document.getElementById('contextMenu');
+		menu.style.left = x + 'px';
+		menu.style.top = y + 'px';
+		menu.classList.remove('hidden');
+		
+		// Adjust if off-screen
+		const rect = menu.getBoundingClientRect();
+		if (rect.right > window.innerWidth) {
+			menu.style.left = (x - rect.width) + 'px';
+		}
+		if (rect.bottom > window.innerHeight) {
+			menu.style.top = (y - rect.height) + 'px';
+		}
+	},
+
+	hideContextMenu() {
+		document.getElementById('contextMenu')?.classList.add('hidden');
+	},
+
+	contextAction(action) {
+		this.hideContextMenu();
+		
+		if (this.selectedNodes.size === 0) return;
+		
+		if (action === 'open' && this.selectedNodes.size === 1) {
+			const uuid = Array.from(this.selectedNodes)[0];
+			this.selectNode(uuid);
+		} else if (action === 'addTag') {
+			if (this.selectedNodes.size === 1) {
+				this.selectNode(Array.from(this.selectedNodes)[0]);
+				setTimeout(() => this.showAddTag(), 100);
+			} else {
+				this.showBulkEditModal();
+			}
+		} else if (action === 'addRelationship') {
+			if (this.selectedNodes.size === 1) {
+				this.selectNode(Array.from(this.selectedNodes)[0]);
+				setTimeout(() => this.showAddRelationshipModal(), 100);
+			} else {
+				this.showBulkEditModal();
+			}
+		} else if (action === 'delete') {
+			if (this.selectedNodes.size === 1) {
+				this.selectNode(Array.from(this.selectedNodes)[0]);
+				setTimeout(() => this.deleteNode(), 100);
+			} else {
+				this.showBulkEditModal();
+			}
+		}
+	},
+
+	// ========== BULK EDIT ==========
+
+	showBulkEditModal() {
+		document.getElementById('bulkEditCount').textContent = this.selectedNodes.size;
+		document.getElementById('bulkEditError').classList.add('hidden');
+		document.getElementById('bulkEditSuccess').classList.add('hidden');
+		document.getElementById('bulkAddTagsInput').value = '';
+		document.getElementById('bulkRemoveTagsInput').value = '';
+		document.getElementById('bulkRelationType').value = '';
+		document.getElementById('bulkRelationTarget').value = '';
+		document.getElementById('bulkMetadataInput').value = '';
+		
+		// Load relation types and paths for datalists
+		this.loadRelationshipDataLists('bulk');
+		
+		document.getElementById('bulkEditModal').classList.remove('hidden');
+	},
+
+	closeBulkEditModal() {
+		document.getElementById('bulkEditModal').classList.add('hidden');
+	},
+
+	showBulkError(msg) {
+		const el = document.getElementById('bulkEditError');
+		el.textContent = msg;
+		el.classList.remove('hidden');
+	},
+
+	showBulkSuccess(msg) {
+		const el = document.getElementById('bulkEditSuccess');
+		el.textContent = msg;
+		el.classList.remove('hidden');
+	},
+
+	async bulkAddTags() {
+		const input = document.getElementById('bulkAddTagsInput').value;
+		const tags = input.split(',').map(t => t.trim().toLowerCase()).filter(t => t);
+		
+		if (tags.length === 0) {
+			this.showBulkError('Enter at least one tag');
+			return;
+		}
+		
+		try {
+			const resp = await fetch('/api/bulk/tags', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ uuids: Array.from(this.selectedNodes), tags })
+			});
+			const data = await resp.json();
+			if (!resp.ok) throw new Error(data.error);
+			this.showBulkSuccess(`Added ${tags.length} tag(s) to ${data.count} items`);
+			await this.refreshAfterBulk();
+		} catch (e) {
+			this.showBulkError(e.message);
+		}
+	},
+
+	async bulkRemoveTags() {
+		const input = document.getElementById('bulkRemoveTagsInput').value;
+		const tags = input.split(',').map(t => t.trim().toLowerCase()).filter(t => t);
+		
+		if (tags.length === 0) {
+			this.showBulkError('Enter at least one tag');
+			return;
+		}
+		
+		try {
+			const resp = await fetch('/api/bulk/tags', {
+				method: 'DELETE',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ uuids: Array.from(this.selectedNodes), tags })
+			});
+			const data = await resp.json();
+			if (!resp.ok) throw new Error(data.error);
+			this.showBulkSuccess(`Removed ${tags.length} tag(s) from ${data.count} items`);
+			await this.refreshAfterBulk();
+		} catch (e) {
+			this.showBulkError(e.message);
+		}
+	},
+
+	async bulkAddRelationship() {
+		const relation = document.getElementById('bulkRelationType').value.trim().toUpperCase();
+		const targetPath = document.getElementById('bulkRelationTarget').value.trim();
+		
+		if (!relation || !targetPath) {
+			this.showBulkError('Relationship type and target path required');
+			return;
+		}
+		
+		try {
+			const resp = await fetch('/api/bulk/relationships', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					source_uuids: Array.from(this.selectedNodes),
+					target_path: targetPath,
+					relation
+				})
+			});
+			const data = await resp.json();
+			if (!resp.ok) throw new Error(data.error);
+			this.showBulkSuccess(`Added relationship to ${data.count} items`);
+			await this.refreshAfterBulk();
+		} catch (e) {
+			this.showBulkError(e.message);
+		}
+	},
+
+	async bulkAddMetadata() {
+		const input = document.getElementById('bulkMetadataInput').value.trim();
+		
+		let metadata;
+		try {
+			metadata = JSON.parse(input);
+			if (typeof metadata !== 'object' || Array.isArray(metadata)) {
+				throw new Error('Must be a JSON object');
+			}
+		} catch (e) {
+			this.showBulkError(`Invalid JSON: ${e.message}`);
+			return;
+		}
+		
+		try {
+			const resp = await fetch('/api/bulk/metadata', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ uuids: Array.from(this.selectedNodes), metadata })
+			});
+			const data = await resp.json();
+			if (!resp.ok) throw new Error(data.error);
+			this.showBulkSuccess(`Merged metadata into ${data.count} items`);
+			await this.refreshAfterBulk();
+		} catch (e) {
+			this.showBulkError(e.message);
+		}
+	},
+
+	async bulkDelete() {
+		if (!confirm(`Delete ${this.selectedNodes.size} items? This cannot be undone.`)) {
+			return;
+		}
+		
+		try {
+			const resp = await fetch('/api/bulk/delete', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ uuids: Array.from(this.selectedNodes) })
+			});
+			const data = await resp.json();
+			if (!resp.ok) throw new Error(data.error);
+			
+			this.closeBulkEditModal();
+			this.clearSelection();
+			await this.loadTree();
+			await this.executeQuery(document.getElementById('queryInput')?.value || '');
+		} catch (e) {
+			this.showBulkError(e.message);
+		}
+	},
+
+	async refreshAfterBulk() {
+		await this.loadTree();
+		if (this.currentNode) {
+			await this.selectNode(this.currentNode.uuid);
+		}
+	},
+
+	// ========== RELATIONSHIPS ==========
+
+	async showAddRelationshipModal() {
+		if (!this.currentNode) return;
+		
+		document.getElementById('addRelError').classList.add('hidden');
+		document.getElementById('relationType').value = '';
+		document.getElementById('relationTarget').value = '';
+		
+		await this.loadRelationshipDataLists('');
+		
+		document.getElementById('addRelationshipModal').classList.remove('hidden');
+	},
+
+	closeAddRelationshipModal() {
+		document.getElementById('addRelationshipModal').classList.add('hidden');
+	},
+
+	async loadRelationshipDataLists(prefix) {
+		try {
+			// Load relation types
+			const typesResp = await fetch('/api/relationships/types');
+			const typesData = await typesResp.json();
+			
+			const typesList = document.getElementById(prefix ? `${prefix}RelationTypesList` : 'relationTypesList');
+			if (typesList) {
+				typesList.innerHTML = typesData.types.map(t => `<option value="${this.escapeAttr(t)}">`).join('');
+			}
+			
+			// Load paths
+			const pathsList = document.getElementById(prefix ? `${prefix}RelationTargetsList` : 'relationTargetsList');
+			if (pathsList) {
+				const paths = this.treeNodes.map(n => n.path);
+				pathsList.innerHTML = paths.map(p => `<option value="${this.escapeAttr(p)}">`).join('');
+			}
+		} catch (e) {
+			console.error('Failed to load relationship datalists:', e);
+		}
+	},
+
+	async addRelationship() {
+		if (!this.currentNode) return;
+		
+		const relation = document.getElementById('relationType').value.trim().toUpperCase();
+		const targetPath = document.getElementById('relationTarget').value.trim();
+		const errorEl = document.getElementById('addRelError');
+		
+		if (!relation || !targetPath) {
+			errorEl.textContent = 'Relationship type and target path are required';
+			errorEl.classList.remove('hidden');
+			return;
+		}
+		
+		try {
+			const resp = await fetch(`/api/nodes/${this.currentNode.uuid}/relationships`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ target_path: targetPath, relation })
+			});
+			const data = await resp.json();
+			if (!resp.ok) throw new Error(data.error);
+			
+			this.closeAddRelationshipModal();
+			await this.selectNode(this.currentNode.uuid);
+		} catch (e) {
+			errorEl.textContent = e.message;
+			errorEl.classList.remove('hidden');
+		}
+	},
+
+	async removeRelationship(targetUuid, relation, direction) {
+		if (!this.currentNode) return;
+		
+		if (!confirm(`Remove this relationship?`)) return;
+		
+		try {
+			const resp = await fetch(`/api/nodes/${this.currentNode.uuid}/relationships`, {
+				method: 'DELETE',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ target_uuid: targetUuid, relation, direction })
+			});
+			const data = await resp.json();
+			if (!resp.ok) throw new Error(data.error);
+			
+			await this.selectNode(this.currentNode.uuid);
+		} catch (e) {
+			this.showError(e.message);
+		}
+	},
 };
 
 document.addEventListener('DOMContentLoaded', () => {

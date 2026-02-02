@@ -253,18 +253,17 @@ class AutocompleteProvider:
 					section=section
 				))
 		
-		# Match metadata keys
-		meta_keys = self._get_metadata_keys()
-		for key in meta_keys:
-			if key.lower().startswith(prefix_lower):
-				suggestions.append(Suggestion(
-					text=f"{key}:",
-					display=f"{key}:",
-					type=SuggestionType.METADATA_KEY,
-					description="Metadata field",
-					insert_text=f"{key}:",
-					section="Metadata"
-				))
+		# Match metadata keys (including nested)
+		meta_keys = self._get_nested_metadata_keys(prefix_lower)
+		for key in meta_keys[:20]:
+			suggestions.append(Suggestion(
+				text=f"{key}:",
+				display=f"{key}:",
+				type=SuggestionType.METADATA_KEY,
+				description="Metadata field",
+				insert_text=f"{key}:",
+				section="Metadata"
+			))
 		
 		# Match tags with tag: prefix
 		tags = self._get_all_tags()
@@ -306,29 +305,22 @@ class AutocompleteProvider:
 		prefix_lower = prefix.lower()
 		key_lower = key.lower()
 		
+		# Handle reserved keywords first
 		if key_lower == 'tag':
 			tags = self._get_all_tags()
 			for tag in tags:
 				if not prefix or tag.startswith(prefix_lower):
 					suggestions.append(Suggestion(
-						text=tag,
-						display=tag,
-						type=SuggestionType.TAG,
-						description="Tag",
-						insert_text=tag,
-						section="Tags"
+						text=tag, display=tag, type=SuggestionType.TAG,
+						description="Tag", insert_text=tag, section="Tags"
 					))
 		
 		elif key_lower == 'type':
 			for t in ['VAULT', 'RECORD']:
 				if not prefix or t.lower().startswith(prefix_lower):
 					suggestions.append(Suggestion(
-						text=t,
-						display=t,
-						type=SuggestionType.NODE_TYPE,
-						description="Node type",
-						insert_text=t,
-						section="Types"
+						text=t, display=t, type=SuggestionType.NODE_TYPE,
+						description="Node type", insert_text=t, section="Types"
 					))
 		
 		elif key_lower == 'ext':
@@ -336,12 +328,8 @@ class AutocompleteProvider:
 			for ext in extensions:
 				if not prefix or ext.startswith(prefix_lower):
 					suggestions.append(Suggestion(
-						text=ext,
-						display=ext,
-						type=SuggestionType.EXTENSION,
-						description="File extension",
-						insert_text=ext,
-						section="Extensions"
+						text=ext, display=ext, type=SuggestionType.EXTENSION,
+						description="File extension", insert_text=ext, section="Extensions"
 					))
 		
 		elif key_lower in ('inside', 'path'):
@@ -349,12 +337,8 @@ class AutocompleteProvider:
 			for path in paths:
 				if not prefix or path.lower().startswith(prefix_lower):
 					suggestions.append(Suggestion(
-						text=path,
-						display=path,
-						type=SuggestionType.PATH,
-						description="Path",
-						insert_text=path,
-						section="Paths"
+						text=path, display=path, type=SuggestionType.PATH,
+						description="Path", insert_text=path, section="Paths"
 					))
 		
 		elif key_lower == 'sort':
@@ -362,24 +346,17 @@ class AutocompleteProvider:
 				if not prefix or opt.startswith(prefix_lower):
 					desc = "Descending" if opt.startswith('-') else "Ascending"
 					suggestions.append(Suggestion(
-						text=opt,
-						display=opt,
-						type=SuggestionType.KEYWORD,
-						description=desc,
-						insert_text=opt,
-						section="Sort"
+						text=opt, display=opt, type=SuggestionType.KEYWORD,
+						description=desc, insert_text=opt, section="Sort"
 					))
 		
 		elif key_lower == 'preview':
 			for val in ['true', 'false']:
 				if not prefix or val.startswith(prefix_lower):
 					suggestions.append(Suggestion(
-						text=val,
-						display=val,
-						type=SuggestionType.KEYWORD,
+						text=val, display=val, type=SuggestionType.KEYWORD,
 						description="Has preview" if val == 'true' else "No preview",
-						insert_text=val,
-						section="Values"
+						insert_text=val, section="Values"
 					))
 		
 		elif key_lower == 'size':
@@ -387,37 +364,26 @@ class AutocompleteProvider:
 			for size in sizes:
 				if not prefix or size.startswith(prefix_lower):
 					suggestions.append(Suggestion(
-						text=size,
-						display=size,
-						type=SuggestionType.KEYWORD,
-						description="Size",
-						insert_text=size,
-						section="Sizes"
+						text=size, display=size, type=SuggestionType.KEYWORD,
+						description="Size", insert_text=size, section="Sizes"
 					))
 		
 		elif key_lower in ('files', 'limit'):
-			# Numeric suggestions
 			for num in ['1', '5', '10', '25', '50', '100']:
 				if not prefix or num.startswith(prefix):
 					suggestions.append(Suggestion(
-						text=num,
-						display=num,
-						type=SuggestionType.KEYWORD,
-						description="",
-						insert_text=num,
-						section="Numbers"
+						text=num, display=num, type=SuggestionType.KEYWORD,
+						description="", insert_text=num, section="Numbers"
 					))
 		
 		else:
-			# It's a metadata key - suggest values for this key
-			values = self._get_metadata_values(key)
+			# It's a metadata key (possibly nested) - suggest values
+			values = self._get_nested_metadata_values(key)
 			for val in values:
 				val_str = str(val)
 				if not prefix or val_str.lower().startswith(prefix_lower):
 					suggestions.append(Suggestion(
-						text=val_str,
-						display=val_str,
-						type=SuggestionType.METADATA_VALUE,
+						text=val_str, display=val_str, type=SuggestionType.METADATA_VALUE,
 						description=f"{key} value",
 						insert_text=val_str if ' ' not in val_str else f'"{val_str}"',
 						section="Values"
@@ -536,4 +502,63 @@ class AutocompleteProvider:
 				except:
 					pass
 			self._cache[cache_key] = sorted(values, key=lambda x: str(x))[:50]
+		return self._cache[cache_key]
+
+	def _get_nested_metadata_keys(self, prefix: str = '') -> List[str]:
+		"""Get metadata keys including nested paths."""
+		if 'nested_meta_keys' not in self._cache:
+			keys = set()
+			cursor = self.conn.execute("SELECT metadata FROM nodes WHERE metadata IS NOT NULL AND metadata != '{}' LIMIT 500")
+			
+			def extract_keys(obj, path=''):
+				if isinstance(obj, dict):
+					for k, v in obj.items():
+						full_path = f"{path}.{k}" if path else k
+						keys.add(full_path)
+						if isinstance(v, dict):
+							extract_keys(v, full_path)
+			
+			for row in cursor:
+				try:
+					meta = json.loads(row[0])
+					if isinstance(meta, dict):
+						extract_keys(meta)
+				except:
+					pass
+			
+			self._cache['nested_meta_keys'] = sorted(keys)[:100]
+
+		result = self._cache['nested_meta_keys']
+		if prefix:
+			result = [k for k in result if k.lower().startswith(prefix.lower())]
+		return result
+
+	def _get_nested_metadata_values(self, key: str) -> List[Any]:
+		"""Get values for a metadata key (supports nested paths like 'artist.name')."""
+		cache_key = f'meta_values_{key}'
+		if cache_key not in self._cache:
+			values = set()
+			cursor = self.conn.execute("SELECT metadata FROM nodes WHERE metadata IS NOT NULL LIMIT 500")
+			
+			# Split key into path parts
+			parts = key.split('.')
+			
+			for row in cursor:
+				try:
+					meta = json.loads(row[0])
+					# Navigate to nested value
+					current = meta
+					for part in parts:
+						if isinstance(current, dict) and part in current:
+							current = current[part]
+						else:
+							current = None
+							break
+					
+					if current is not None and isinstance(current, (str, int, float, bool)):
+						values.add(current)
+				except:
+					pass
+			
+			self._cache[cache_key] = sorted(values, key=str)[:50]
 		return self._cache[cache_key]

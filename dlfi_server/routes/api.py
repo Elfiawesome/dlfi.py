@@ -688,6 +688,242 @@ def add_relationship(uuid: str):
 	except ValueError as e:
 		return jsonify({"error": str(e)}), 400
 
+# ============ Relationships (Enhanced) ============
+
+@api_bp.route("/relationships/types", methods=["GET"])
+@require_vault
+def list_relationship_types():
+	"""List all unique relationship types used in the vault."""
+	dlfi = get_dlfi()
+	
+	cursor = dlfi.conn.execute("SELECT DISTINCT relation FROM edges ORDER BY relation")
+	types = [row[0] for row in cursor]
+	
+	# Add common suggested types if not present
+	common_types = ['AUTHORED_BY', 'CREATED_BY', 'PART_OF', 'RELATED_TO', 'REFERENCES', 'PARENT_OF', 'CHILD_OF']
+	for t in common_types:
+		if t not in types:
+			types.append(t)
+	
+	types.sort()
+	return jsonify({"types": types})
+
+
+@api_bp.route("/nodes/<uuid>/relationships", methods=["GET"])
+@require_vault
+def get_node_relationships(uuid: str):
+	"""Get all relationships for a node (both incoming and outgoing)."""
+	dlfi = get_dlfi()
+	
+	# Outgoing relationships
+	outgoing_cursor = dlfi.conn.execute("""
+		SELECT e.relation, e.target_uuid, n.cached_path, n.name, n.type
+		FROM edges e
+		JOIN nodes n ON e.target_uuid = n.uuid
+		WHERE e.source_uuid = ?
+	""", (uuid,))
+	
+	outgoing = []
+	for rel, target_uuid, target_path, target_name, target_type in outgoing_cursor:
+		outgoing.append({
+			"relation": rel,
+			"target_uuid": target_uuid,
+			"target_path": target_path,
+			"target_name": target_name,
+			"target_type": target_type
+		})
+	
+	# Incoming relationships
+	incoming_cursor = dlfi.conn.execute("""
+		SELECT e.relation, e.source_uuid, n.cached_path, n.name, n.type
+		FROM edges e
+		JOIN nodes n ON e.source_uuid = n.uuid
+		WHERE e.target_uuid = ?
+	""", (uuid,))
+	
+	incoming = []
+	for rel, source_uuid, source_path, source_name, source_type in incoming_cursor:
+		incoming.append({
+			"relation": rel,
+			"source_uuid": source_uuid,
+			"source_path": source_path,
+			"source_name": source_name,
+			"source_type": source_type
+		})
+	
+	return jsonify({"outgoing": outgoing, "incoming": incoming})
+
+
+@api_bp.route("/nodes/<uuid>/relationships", methods=["DELETE"])
+@require_vault
+def delete_relationship(uuid: str):
+	"""Delete a relationship from this node."""
+	dlfi = get_dlfi()
+	data = request.get_json() or {}
+	
+	target_uuid = data.get("target_uuid")
+	relation = data.get("relation")
+	direction = data.get("direction", "outgoing")  # "outgoing" or "incoming"
+	
+	if not target_uuid or not relation:
+		return jsonify({"error": "target_uuid and relation required"}), 400
+	
+	try:
+		with dlfi.conn:
+			if direction == "outgoing":
+				dlfi.conn.execute(
+					"DELETE FROM edges WHERE source_uuid = ? AND target_uuid = ? AND relation = ?",
+					(uuid, target_uuid, relation)
+				)
+			else:
+				dlfi.conn.execute(
+					"DELETE FROM edges WHERE source_uuid = ? AND target_uuid = ? AND relation = ?",
+					(target_uuid, uuid, relation)
+				)
+		return jsonify({"success": True})
+	except Exception as e:
+		return jsonify({"error": str(e)}), 500
+
+
+# ============ Bulk Operations ============
+
+@api_bp.route("/bulk/tags", methods=["POST"])
+@require_vault
+def bulk_add_tags():
+	"""Add tags to multiple nodes."""
+	dlfi = get_dlfi()
+	data = request.get_json() or {}
+	
+	uuids = data.get("uuids", [])
+	tags = data.get("tags", [])
+	
+	if not uuids or not tags:
+		return jsonify({"error": "uuids and tags required"}), 400
+	
+	try:
+		with dlfi.conn:
+			for uuid in uuids:
+				for tag in tags:
+					dlfi.conn.execute(
+						"INSERT OR IGNORE INTO tags (node_uuid, tag) VALUES (?, ?)",
+						(uuid, tag.lower().strip())
+					)
+		return jsonify({"success": True, "count": len(uuids)})
+	except Exception as e:
+		return jsonify({"error": str(e)}), 500
+
+
+@api_bp.route("/bulk/tags", methods=["DELETE"])
+@require_vault
+def bulk_remove_tags():
+	"""Remove tags from multiple nodes."""
+	dlfi = get_dlfi()
+	data = request.get_json() or {}
+	
+	uuids = data.get("uuids", [])
+	tags = data.get("tags", [])
+	
+	if not uuids or not tags:
+		return jsonify({"error": "uuids and tags required"}), 400
+	
+	try:
+		with dlfi.conn:
+			for uuid in uuids:
+				for tag in tags:
+					dlfi.conn.execute(
+						"DELETE FROM tags WHERE node_uuid = ? AND tag = ?",
+						(uuid, tag.lower().strip())
+					)
+		return jsonify({"success": True, "count": len(uuids)})
+	except Exception as e:
+		return jsonify({"error": str(e)}), 500
+
+
+@api_bp.route("/bulk/relationships", methods=["POST"])
+@require_vault
+def bulk_add_relationships():
+	"""Add relationships from multiple nodes to a target."""
+	dlfi = get_dlfi()
+	data = request.get_json() or {}
+	
+	source_uuids = data.get("source_uuids", [])
+	target_path = data.get("target_path")
+	relation = data.get("relation")
+	
+	if not source_uuids or not target_path or not relation:
+		return jsonify({"error": "source_uuids, target_path, and relation required"}), 400
+	
+	# Get target UUID
+	cursor = dlfi.conn.execute("SELECT uuid FROM nodes WHERE cached_path = ?", (target_path,))
+	row = cursor.fetchone()
+	if not row:
+		return jsonify({"error": f"Target not found: {target_path}"}), 404
+	
+	target_uuid = row[0]
+	
+	try:
+		with dlfi.conn:
+			for source_uuid in source_uuids:
+				dlfi.conn.execute("""
+					INSERT OR REPLACE INTO edges (source_uuid, target_uuid, relation, created_at)
+					VALUES (?, ?, ?, ?)
+				""", (source_uuid, target_uuid, relation.upper(), time.time()))
+		return jsonify({"success": True, "count": len(source_uuids)})
+	except Exception as e:
+		return jsonify({"error": str(e)}), 500
+
+
+@api_bp.route("/bulk/delete", methods=["POST"])
+@require_vault
+def bulk_delete():
+	"""Delete multiple nodes."""
+	dlfi = get_dlfi()
+	data = request.get_json() or {}
+	
+	uuids = data.get("uuids", [])
+	
+	if not uuids:
+		return jsonify({"error": "uuids required"}), 400
+	
+	try:
+		with dlfi.conn:
+			for uuid in uuids:
+				dlfi.conn.execute("DELETE FROM nodes WHERE uuid = ?", (uuid,))
+		return jsonify({"success": True, "count": len(uuids)})
+	except Exception as e:
+		return jsonify({"error": str(e)}), 500
+
+
+@api_bp.route("/bulk/metadata", methods=["POST"])
+@require_vault
+def bulk_update_metadata():
+	"""Merge metadata into multiple nodes."""
+	dlfi = get_dlfi()
+	data = request.get_json() or {}
+	
+	uuids = data.get("uuids", [])
+	metadata = data.get("metadata", {})
+	
+	if not uuids or not metadata:
+		return jsonify({"error": "uuids and metadata required"}), 400
+	
+	try:
+		with dlfi.conn:
+			for uuid in uuids:
+				# Get existing metadata
+				cursor = dlfi.conn.execute("SELECT metadata FROM nodes WHERE uuid = ?", (uuid,))
+				row = cursor.fetchone()
+				if row:
+					existing = json.loads(row[0]) if row[0] else {}
+					# Merge new metadata
+					existing.update(metadata)
+					dlfi.conn.execute(
+						"UPDATE nodes SET metadata = ?, last_modified = ? WHERE uuid = ?",
+						(json.dumps(existing), time.time(), uuid)
+					)
+		return jsonify({"success": True, "count": len(uuids)})
+	except Exception as e:
+		return jsonify({"error": str(e)}), 500
 
 # ============ Tags ============
 
