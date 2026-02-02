@@ -8,7 +8,7 @@ def main():
 	parser.add_argument("--host", default="127.0.0.1", help="Server host (default: 127.0.0.1)")
 	parser.add_argument("--port", "-p", type=int, default=8080, help="Server port (default: 8080)")
 	parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-	parser.add_argument("--vaults-dir", "-d", default=".archive", help="Default directory for vaults (default: .vaults)")
+	parser.add_argument("--vaults-dir", "-d", default=".archive/", help="Default directory for vaults (default: .vaults)")
 	
 	args = parser.parse_args()
 	

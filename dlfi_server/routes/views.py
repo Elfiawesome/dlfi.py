@@ -14,7 +14,7 @@ def get_vault_info(vault_path: Path) -> dict:
 	encrypted = False
 	if config_path.exists():
 		try:
-			with open(config_path) as f:
+			with open(config_path, 'r', encoding='utf-8') as f:
 				vault_config = json.load(f)
 				encrypted = vault_config.get("encrypted", False)
 		except:
@@ -36,22 +36,27 @@ def home():
 	# Find vaults in default directory
 	default_vaults = []
 	if default_dir.exists():
-		for item in default_dir.iterdir():
-			if item.is_dir() and (item / ".dlfi").exists():
-				default_vaults.append(get_vault_info(item))
+		try:
+			for item in default_dir.iterdir():
+				if item.is_dir() and (item / ".dlfi").exists():
+					default_vaults.append(get_vault_info(item))
+		except PermissionError:
+			pass
 	
 	default_vaults.sort(key=lambda x: x["name"].lower())
 	
 	# Get recent vaults (from other locations)
-	recent_paths = config.get_recent_vaults()
 	recent_vaults = []
-	for path_str in recent_paths:
-		path = Path(path_str)
-		# Skip if it's in the default directory (already listed)
-		if default_dir in path.parents or path.parent == default_dir:
+	for vault_info in config.get_recent_vaults():
+		vault_path = Path(vault_info["path"])
+		# Skip if it's in the default directory
+		try:
+			vault_path.relative_to(default_dir)
+			# If we get here, it's inside default_dir, skip it
 			continue
-		if path.exists() and (path / ".dlfi").exists():
-			recent_vaults.append(get_vault_info(path))
+		except ValueError:
+			# Not inside default_dir, include it
+			recent_vaults.append(vault_info)
 	
 	return render_template(
 		"home.html",

@@ -36,16 +36,25 @@ def open_vault():
 	from dlfi import DLFI
 	
 	data = request.get_json() or {}
-	vault_path = data.get("path")
-	password = data.get("password")
+	vault_path = data.get("path", "").strip()
+	password = data.get("password") or None  # Convert empty string to None
 	
 	if not vault_path:
 		return jsonify({"error": "Vault path required"}), 400
 	
-	vault_path = Path(vault_path).resolve()
+	# Resolve and normalize path
+	try:
+		vault_path = Path(vault_path).resolve()
+	except Exception as e:
+		return jsonify({"error": f"Invalid path: {e}"}), 400
+	
+	logger.info(f"Attempting to open vault at: {vault_path}")
 	
 	if not vault_path.exists():
-		return jsonify({"error": "Path does not exist"}), 404
+		return jsonify({"error": f"Path does not exist: {vault_path}"}), 404
+	
+	if not vault_path.is_dir():
+		return jsonify({"error": "Path is not a directory"}), 400
 	
 	if not (vault_path / ".dlfi").exists():
 		return jsonify({"error": "Not a valid DLFI vault (no .dlfi folder found)"}), 400
@@ -57,6 +66,7 @@ def open_vault():
 			existing.close()
 		except:
 			pass
+		current_app.config["DLFI_INSTANCE"] = None
 	
 	try:
 		dlfi = DLFI(str(vault_path), password=password)
@@ -67,6 +77,8 @@ def open_vault():
 		config = current_app.config["DLFI_CONFIG"]
 		config.add_recent_vault(str(vault_path))
 		
+		logger.info(f"Successfully opened vault: {vault_path}")
+		
 		return jsonify({
 			"success": True,
 			"name": vault_path.name,
@@ -74,6 +86,7 @@ def open_vault():
 			"encrypted": dlfi.config.encrypted
 		})
 	except ValueError as e:
+		logger.warning(f"Failed to open vault (auth error): {e}")
 		return jsonify({"error": str(e)}), 401
 	except Exception as e:
 		logger.exception("Failed to open vault")
@@ -86,9 +99,9 @@ def create_vault():
 	from dlfi import DLFI
 	
 	data = request.get_json() or {}
-	vault_path = data.get("path")
-	vault_name = data.get("name")
-	password = data.get("password")
+	vault_path = data.get("path", "").strip()
+	vault_name = data.get("name", "").strip()
+	password = data.get("password") or None  # Convert empty string to None
 	use_default_dir = data.get("use_default_dir", True)
 	
 	config = current_app.config["DLFI_CONFIG"]
@@ -96,12 +109,15 @@ def create_vault():
 	# Determine the full path
 	if vault_path:
 		# Full path provided
-		full_path = Path(vault_path).resolve()
+		try:
+			full_path = Path(vault_path).resolve()
+		except Exception as e:
+			return jsonify({"error": f"Invalid path: {e}"}), 400
 	elif vault_name:
-		# Just a name provided, use default directory or custom path
 		if use_default_dir:
-			# Sanitize name
+			# Sanitize name - allow alphanumeric, dots, underscores, hyphens, spaces
 			safe_name = "".join(c for c in vault_name if c.isalnum() or c in "._- ")
+			safe_name = safe_name.strip()
 			if not safe_name:
 				return jsonify({"error": "Invalid vault name"}), 400
 			full_path = config.default_vaults_dir / safe_name
@@ -110,6 +126,9 @@ def create_vault():
 	else:
 		return jsonify({"error": "Vault path or name required"}), 400
 	
+	logger.info(f"Attempting to create vault at: {full_path}")
+	
+	# Check if already exists as a vault
 	if full_path.exists() and (full_path / ".dlfi").exists():
 		return jsonify({"error": "Vault already exists at this location"}), 409
 	
@@ -120,14 +139,20 @@ def create_vault():
 			existing.close()
 		except:
 			pass
+		current_app.config["DLFI_INSTANCE"] = None
 	
 	try:
-		dlfi = DLFI(str(full_path), password=password if password else None)
+		# Create parent directories if needed
+		full_path.mkdir(parents=True, exist_ok=True)
+		
+		dlfi = DLFI(str(full_path), password=password)
 		current_app.config["DLFI_INSTANCE"] = dlfi
 		current_app.config["DLFI_PASSWORD"] = password
 		
 		# Add to recent vaults
 		config.add_recent_vault(str(full_path))
+		
+		logger.info(f"Successfully created vault: {full_path}")
 		
 		return jsonify({
 			"success": True,
@@ -151,8 +176,10 @@ def vault_info():
 	counts = dict(cursor.fetchall())
 	
 	# Count blobs
-	cursor = dlfi.conn.execute("SELECT COUNT(*), SUM(size_bytes) FROM blobs")
-	blob_count, total_size = cursor.fetchone()
+	cursor = dlfi.conn.execute("SELECT COUNT(*), COALESCE(SUM(size_bytes), 0) FROM blobs")
+	row = cursor.fetchone()
+	blob_count = row[0] or 0
+	total_size = row[1] or 0
 	
 	return jsonify({
 		"name": Path(dlfi.root).name,
@@ -161,8 +188,8 @@ def vault_info():
 		"partition_size": dlfi.config.partition_size,
 		"vault_count": counts.get("VAULT", 0),
 		"record_count": counts.get("RECORD", 0),
-		"blob_count": blob_count or 0,
-		"total_size": total_size or 0
+		"blob_count": blob_count,
+		"total_size": total_size
 	})
 
 
