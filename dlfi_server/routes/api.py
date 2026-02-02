@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Optional
 from flask import Blueprint, request, jsonify, current_app, Response
 from io import BytesIO
+from dlfi_server.query import QueryParser, QueryExecutor, AutocompleteProvider, ParseError
 
 logger = logging.getLogger(__name__)
 
@@ -650,3 +651,129 @@ def export_static():
 		return jsonify({"success": True, "message": "Static site generated in vault root"})
 	except Exception as e:
 		return jsonify({"error": str(e)}), 500
+
+# ============ Query System ============
+
+@api_bp.route("/query", methods=["POST"])
+@require_vault
+def execute_query():
+    """Execute a query and return matching nodes."""
+    dlfi = get_dlfi()
+    data = request.get_json() or {}
+    
+    query_str = data.get("query", "")
+    offset = int(data.get("offset", 0))
+    
+    if not query_str.strip():
+        # Empty query - return all nodes
+        query_str = "type:VAULT | type:RECORD"
+    
+    try:
+        parser = QueryParser(query_str)
+        ast = parser.parse()
+        
+        executor = QueryExecutor(dlfi)
+        result = executor.execute(ast, offset=offset)
+        
+        return jsonify({
+            "success": True,
+            "nodes": result.nodes,
+            "total": result.total_count,
+            "limit": result.limit,
+            "offset": result.offset,
+            "query_time_ms": result.query_time_ms
+        })
+    except ParseError as e:
+        return jsonify({
+            "error": f"Query parse error: {e.message}",
+            "position": e.position
+        }), 400
+    except Exception as e:
+        logger.exception("Query execution failed")
+        return jsonify({"error": str(e)}), 500
+
+
+@api_bp.route("/autocomplete", methods=["GET"])
+@require_vault
+def get_autocomplete():
+    """Get autocomplete suggestions for a query."""
+    dlfi = get_dlfi()
+    
+    query = request.args.get("q", "")
+    cursor_pos = request.args.get("cursor")
+    
+    if cursor_pos is not None:
+        cursor_pos = int(cursor_pos)
+    
+    provider = AutocompleteProvider(dlfi)
+    suggestions = provider.get_suggestions(query, cursor_pos)
+    
+    return jsonify({"suggestions": suggestions})
+
+
+@api_bp.route("/query/help", methods=["GET"])
+def get_query_help():
+    """Return query language documentation."""
+    return jsonify({
+        "syntax": [
+            {
+                "category": "Basic Search",
+                "items": [
+                    {"syntax": "text", "description": "Global search across name, path, tags, and metadata"},
+                    {"syntax": '"quoted text"', "description": "Search for exact phrase"},
+                    {"syntax": "tag:value", "description": "Find nodes with tag containing value"},
+                    {"syntax": "tag=value", "description": "Find nodes with exact tag match"},
+                    {"syntax": "-tag:value", "description": "Exclude nodes with tag"},
+                ]
+            },
+            {
+                "category": "Metadata",
+                "items": [
+                    {"syntax": "key:value", "description": "Metadata field contains value"},
+                    {"syntax": "key=value", "description": "Metadata field equals value"},
+                    {"syntax": "key?", "description": "Field exists"},
+                    {"syntax": "-key", "description": "Field does not exist"},
+                    {"syntax": "key>N", "description": "Numeric comparison (>, <, >=, <=)"},
+                    {"syntax": "key:start..end", "description": "Range search"},
+                ]
+            },
+            {
+                "category": "Structure",
+                "items": [
+                    {"syntax": "inside:path", "description": "Search within path"},
+                    {"syntax": "path:pattern*", "description": "Wildcard path match"},
+                    {"syntax": "^term", "description": "Include descendants of matches"},
+                    {"syntax": "%term", "description": "Include ancestors of matches"},
+                ]
+            },
+            {
+                "category": "Relationships",
+                "items": [
+                    {"syntax": "!path", "description": "Nodes related to path"},
+                    {"syntax": "!path:RELATION", "description": "Specific relation type"},
+                    {"syntax": "!path:REL>", "description": "Outgoing relations only"},
+                    {"syntax": "!path:REL<", "description": "Incoming relations only"},
+                    {"syntax": "RELATION_NAME", "description": "Any node with this relation type"},
+                ]
+            },
+            {
+                "category": "Files",
+                "items": [
+                    {"syntax": "ext:mp4", "description": "Filter by extension"},
+                    {"syntax": "files>3", "description": "File count comparison"},
+                    {"syntax": "size>10mb", "description": "Total size comparison"},
+                    {"syntax": "preview:true", "description": "Has visual preview"},
+                ]
+            },
+            {
+                "category": "Logic",
+                "items": [
+                    {"syntax": "a | b", "description": "OR: match either"},
+                    {"syntax": "(a b) | c", "description": "Grouping"},
+                    {"syntax": "type:VAULT", "description": "Filter by node type"},
+                    {"syntax": "limit:50", "description": "Limit results"},
+                    {"syntax": "sort:name", "description": "Sort by field (prefix - for desc)"},
+                ]
+            },
+        ]
+    })

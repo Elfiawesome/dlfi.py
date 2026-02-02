@@ -1,17 +1,20 @@
 /**
- * DLFI Server - Frontend Application
+ * DLFI Server - Frontend Application with Query System
  */
 
 const App = {
 	currentNode: null,
 	nodes: [],
+	queryResults: [],
+	autocompleteTimeout: null,
 	
 	/**
 	 * Initialize the application
 	 */
 	async init() {
 		this.bindEvents();
-		await this.loadNodes();
+		this.initQueryInput();
+		await this.executeQuery('');  // Load all nodes initially
 	},
 	
 	/**
@@ -45,81 +48,316 @@ const App = {
 			if (e.key === 'Escape') {
 				document.querySelectorAll('.modal-overlay').forEach(m => m.classList.add('hidden'));
 				this.closeLightbox();
+				this.hideAutocomplete();
+			}
+			
+			// Focus search with /
+			if (e.key === '/' && document.activeElement.tagName !== 'INPUT') {
+				e.preventDefault();
+				document.getElementById('queryInput')?.focus();
 			}
 		});
 	},
 	
 	/**
-	 * Load all nodes from the API
+	 * Initialize query input with autocomplete
 	 */
-	async loadNodes() {
+	initQueryInput() {
+		const input = document.getElementById('queryInput');
+		const autocomplete = document.getElementById('autocompleteDropdown');
+		
+		if (!input) return;
+		
+		// Input handler with debounce for autocomplete
+		input.addEventListener('input', (e) => {
+			clearTimeout(this.autocompleteTimeout);
+			this.autocompleteTimeout = setTimeout(() => {
+				this.fetchAutocomplete(e.target.value, e.target.selectionStart);
+			}, 150);
+		});
+		
+		// Execute query on Enter
+		input.addEventListener('keydown', (e) => {
+			if (e.key === 'Enter' && !e.shiftKey) {
+				e.preventDefault();
+				this.hideAutocomplete();
+				this.executeQuery(input.value);
+			}
+			
+			// Navigate autocomplete
+			if (e.key === 'ArrowDown') {
+				e.preventDefault();
+				this.navigateAutocomplete(1);
+			} else if (e.key === 'ArrowUp') {
+				e.preventDefault();
+				this.navigateAutocomplete(-1);
+			} else if (e.key === 'Tab' && autocomplete && !autocomplete.classList.contains('hidden')) {
+				e.preventDefault();
+				this.selectAutocomplete();
+			} else if (e.key === 'Escape') {
+				this.hideAutocomplete();
+			}
+		});
+		
+		// Hide autocomplete on blur (with delay for click handling)
+		input.addEventListener('blur', () => {
+			setTimeout(() => this.hideAutocomplete(), 200);
+		});
+		
+		// Show help button
+		document.getElementById('queryHelpBtn')?.addEventListener('click', () => {
+			this.showQueryHelp();
+		});
+	},
+	
+	/**
+	 * Fetch autocomplete suggestions
+	 */
+	async fetchAutocomplete(query, cursorPos) {
+		if (!query) {
+			this.hideAutocomplete();
+			return;
+		}
+		
 		try {
-			const resp = await fetch('/api/nodes');
-			if (!resp.ok) throw new Error('Failed to load nodes');
+			const resp = await fetch(`/api/autocomplete?q=${encodeURIComponent(query)}&cursor=${cursorPos}`);
+			if (!resp.ok) return;
 			
 			const data = await resp.json();
-			this.nodes = data.nodes;
-			this.renderTree();
+			this.showAutocomplete(data.suggestions);
 		} catch (e) {
-			console.error('Failed to load nodes:', e);
-			this.showError('Failed to load vault contents');
+			console.error('Autocomplete failed:', e);
 		}
 	},
 	
 	/**
-	 * Render the tree view
+	 * Show autocomplete dropdown
 	 */
-	renderTree() {
-		const tree = document.getElementById('treeView');
-		if (!tree) return;
+	showAutocomplete(suggestions) {
+		const dropdown = document.getElementById('autocompleteDropdown');
+		if (!dropdown || !suggestions.length) {
+			this.hideAutocomplete();
+			return;
+		}
 		
-		tree.innerHTML = '';
+		dropdown.innerHTML = suggestions.map((s, i) => `
+			<div class="autocomplete-item ${i === 0 ? 'active' : ''}" 
+				data-index="${i}"
+				data-insert="${this.escapeHtml(s.insert_text)}">
+				<span class="autocomplete-text">${this.escapeHtml(s.display)}</span>
+				<span class="autocomplete-type">${s.type}</span>
+				${s.description ? `<span class="autocomplete-desc">${this.escapeHtml(s.description)}</span>` : ''}
+			</div>
+		`).join('');
 		
-		// Build parent map
-		const rootNodes = this.nodes.filter(n => !n.parent);
+		dropdown.classList.remove('hidden');
 		
-		const renderNode = (node, depth = 0) => {
-			const div = document.createElement('div');
-			div.className = `tree-item ${node.type.toLowerCase()}`;
-			div.style.paddingLeft = `${16 + depth * 16}px`;
-			div.dataset.uuid = node.uuid;
-			
-			const icon = node.type === 'VAULT' ? '📁' : '📄';
-			
-			div.innerHTML = `
-				<span class="tree-icon">${icon}</span>
-				<span class="tree-name">${this.escapeHtml(node.name)}</span>
-				${node.file_count > 0 ? `<span class="tree-badge">${node.file_count}</span>` : ''}
-			`;
-			
-			div.addEventListener('click', () => this.selectNode(node.uuid));
-			tree.appendChild(div);
-			
-			// Render children
-			const children = this.nodes.filter(n => n.parent === node.uuid);
-			children.sort((a, b) => {
-				if (a.type !== b.type) return a.type === 'VAULT' ? -1 : 1;
-				return a.name.localeCompare(b.name);
+		// Add click handlers
+		dropdown.querySelectorAll('.autocomplete-item').forEach(item => {
+			item.addEventListener('click', () => {
+				this.applyAutocomplete(item.dataset.insert);
 			});
-			children.forEach(child => renderNode(child, depth + 1));
-		};
-		
-		rootNodes.sort((a, b) => {
-			if (a.type !== b.type) return a.type === 'VAULT' ? -1 : 1;
-			return a.name.localeCompare(b.name);
 		});
-		rootNodes.forEach(node => renderNode(node));
+	},
+	
+	/**
+	 * Hide autocomplete dropdown
+	 */
+	hideAutocomplete() {
+		const dropdown = document.getElementById('autocompleteDropdown');
+		if (dropdown) {
+			dropdown.classList.add('hidden');
+		}
+	},
+	
+	/**
+	 * Navigate autocomplete items
+	 */
+	navigateAutocomplete(direction) {
+		const dropdown = document.getElementById('autocompleteDropdown');
+		if (!dropdown || dropdown.classList.contains('hidden')) return;
+		
+		const items = dropdown.querySelectorAll('.autocomplete-item');
+		const active = dropdown.querySelector('.autocomplete-item.active');
+		let index = active ? parseInt(active.dataset.index) : -1;
+		
+		index += direction;
+		if (index < 0) index = items.length - 1;
+		if (index >= items.length) index = 0;
+		
+		items.forEach(item => item.classList.remove('active'));
+		items[index]?.classList.add('active');
+	},
+	
+	/**
+	 * Select current autocomplete item
+	 */
+	selectAutocomplete() {
+		const dropdown = document.getElementById('autocompleteDropdown');
+		const active = dropdown?.querySelector('.autocomplete-item.active');
+		if (active) {
+			this.applyAutocomplete(active.dataset.insert);
+		}
+	},
+	
+	/**
+	 * Apply autocomplete selection
+	 */
+	applyAutocomplete(insertText) {
+		const input = document.getElementById('queryInput');
+		if (!input) return;
+		
+		const cursorPos = input.selectionStart;
+		const value = input.value;
+		
+		// Find the start of the current token
+		let tokenStart = cursorPos;
+		while (tokenStart > 0 && !/[\s|()]/.test(value[tokenStart - 1])) {
+			tokenStart--;
+		}
+		
+		// Replace current token with insert text
+		const newValue = value.slice(0, tokenStart) + insertText + value.slice(cursorPos);
+		input.value = newValue;
+		
+		// Position cursor after inserted text
+		const newPos = tokenStart + insertText.length;
+		input.setSelectionRange(newPos, newPos);
+		input.focus();
+		
+		this.hideAutocomplete();
+	},
+	
+	/**
+	 * Execute a query
+	 */
+	async executeQuery(query) {
+		const resultsContainer = document.getElementById('queryResults');
+		const statsContainer = document.getElementById('queryStats');
+		
+		if (resultsContainer) {
+			resultsContainer.innerHTML = '<div class="loading"><div class="spinner"></div></div>';
+		}
+		
+		try {
+			const resp = await fetch('/api/query', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ query })
+			});
+			
+			const data = await resp.json();
+			
+			if (!resp.ok) {
+				throw new Error(data.error || 'Query failed');
+			}
+			
+			this.queryResults = data.nodes;
+			this.renderQueryResults(data);
+			
+			if (statsContainer) {
+				statsContainer.textContent = `${data.total} results (${data.query_time_ms}ms)`;
+			}
+			
+		} catch (e) {
+			console.error('Query failed:', e);
+			if (resultsContainer) {
+				resultsContainer.innerHTML = `
+					<div class="query-error">
+						<div class="error-icon">⚠️</div>
+						<div class="error-message">${this.escapeHtml(e.message)}</div>
+					</div>
+				`;
+			}
+		}
+	},
+	
+	/**
+	 * Render query results
+	 */
+	renderQueryResults(data) {
+		const container = document.getElementById('queryResults');
+		if (!container) return;
+		
+		if (!data.nodes.length) {
+			container.innerHTML = `
+				<div class="empty-message">
+					<div class="empty-icon">🔍</div>
+					<div class="empty-title">No results found</div>
+					<div class="empty-text">Try adjusting your query or browse all items.</div>
+				</div>
+			`;
+			return;
+		}
+		
+		container.innerHTML = `
+			<div class="results-list">
+				${data.nodes.map(node => this.renderResultItem(node)).join('')}
+			</div>
+		`;
+	},
+	
+	/**
+	 * Render a single result item
+	 */
+	renderResultItem(node) {
+		const icon = node.type === 'VAULT' ? '📁' : '📄';
+		const tags = node.tags.slice(0, 3).map(t => `<span class="result-tag">${this.escapeHtml(t)}</span>`).join('');
+		const moreTags = node.tags.length > 3 ? `<span class="result-tag-more">+${node.tags.length - 3}</span>` : '';
+		
+		return `
+			<div class="result-item" onclick="App.selectNode('${node.uuid}')">
+				<div class="result-icon">${icon}</div>
+				<div class="result-content">
+					<div class="result-name">${this.escapeHtml(node.name)}</div>
+					<div class="result-path">${this.escapeHtml(node.path)}</div>
+					${node.tags.length ? `<div class="result-tags">${tags}${moreTags}</div>` : ''}
+				</div>
+				<div class="result-meta">
+					${node.file_count > 0 ? `<span class="result-files">${node.file_count} files</span>` : ''}
+					${node.child_count > 0 ? `<span class="result-children">${node.child_count} items</span>` : ''}
+				</div>
+			</div>
+		`;
+	},
+	
+	/**
+	 * Show query help modal
+	 */
+	async showQueryHelp() {
+		try {
+			const resp = await fetch('/api/query/help');
+			const data = await resp.json();
+			
+			const modal = document.getElementById('queryHelpModal');
+			const content = document.getElementById('queryHelpContent');
+			
+			if (modal && content) {
+				content.innerHTML = data.syntax.map(cat => `
+					<div class="help-category">
+						<h3 class="help-category-title">${this.escapeHtml(cat.category)}</h3>
+						<div class="help-items">
+							${cat.items.map(item => `
+								<div class="help-item">
+									<code class="help-syntax">${this.escapeHtml(item.syntax)}</code>
+									<span class="help-desc">${this.escapeHtml(item.description)}</span>
+								</div>
+							`).join('')}
+						</div>
+					</div>
+				`).join('');
+				
+				modal.classList.remove('hidden');
+			}
+		} catch (e) {
+			console.error('Failed to load query help:', e);
+		}
 	},
 	
 	/**
 	 * Select and display a node
 	 */
 	async selectNode(uuid) {
-		// Update tree selection
-		document.querySelectorAll('.tree-item').forEach(el => {
-			el.classList.toggle('active', el.dataset.uuid === uuid);
-		});
-		
 		try {
 			const resp = await fetch(`/api/nodes/${uuid}`);
 			if (!resp.ok) throw new Error('Failed to load node');
@@ -137,28 +375,37 @@ const App = {
 	 * Render node details
 	 */
 	renderNodeDetail(node) {
-		const header = document.getElementById('contentHeader');
-		const body = document.getElementById('contentBody');
+		const panel = document.getElementById('detailPanel');
+		if (!panel) return;
 		
-		if (!header || !body) return;
+		panel.classList.remove('hidden');
 		
-		header.classList.remove('hidden');
+		const header = document.getElementById('detailHeader');
+		const body = document.getElementById('detailBody');
 		
-		// Breadcrumb and title
-		document.getElementById('breadcrumb').textContent = node.path;
-		document.getElementById('contentTitle').textContent = node.name;
+		// Header
+		if (header) {
+			header.innerHTML = `
+				<div class="detail-breadcrumb">${this.escapeHtml(node.path)}</div>
+				<h2 class="detail-title">${this.escapeHtml(node.name)}</h2>
+				<div class="detail-toolbar">
+					<button class="btn btn-sm btn-secondary" onclick="App.closeDetail()">Close</button>
+					<button class="btn btn-sm btn-danger" onclick="App.deleteNode()">Delete</button>
+				</div>
+			`;
+		}
 		
-		// Build content
+		// Body
 		let html = '';
+		
+		// Type badge
+		html += `<div class="detail-type-badge ${node.type.toLowerCase()}">${node.type}</div>`;
 		
 		// Metadata
 		if (Object.keys(node.metadata).length > 0) {
 			html += `
 				<div class="panel">
-					<div class="panel-header">
-						<span class="panel-title">Metadata</span>
-						<button class="btn btn-sm btn-secondary" onclick="App.showEditMetadata()">Edit</button>
-					</div>
+					<div class="panel-header"><span class="panel-title">Metadata</span></div>
 					<div class="panel-body">
 						<div class="meta-grid">
 							${Object.entries(node.metadata).map(([k, v]) => `
@@ -178,7 +425,7 @@ const App = {
 			<div class="panel">
 				<div class="panel-header">
 					<span class="panel-title">Tags</span>
-					<button class="btn btn-sm btn-secondary" onclick="App.showAddTag()">Add Tag</button>
+					<button class="btn btn-sm btn-secondary" onclick="App.showAddTag()">Add</button>
 				</div>
 				<div class="panel-body">
 					${node.tags.length > 0 ? `
@@ -196,19 +443,17 @@ const App = {
 		`;
 		
 		// Relationships
-		if (node.relationships.length > 0) {
+		if (node.relationships && node.relationships.length > 0) {
 			html += `
 				<div class="panel">
-					<div class="panel-header">
-						<span class="panel-title">Relationships</span>
-					</div>
+					<div class="panel-header"><span class="panel-title">Relationships</span></div>
 					<div class="panel-body">
 						<div class="rel-list">
 							${node.relationships.map(r => `
 								<div class="rel-item">
 									<span class="rel-type">${this.escapeHtml(r.relation)}</span>
 									<span class="rel-arrow">→</span>
-									<span class="rel-target" onclick="App.navigateToPath('${r.target_path}')">${this.escapeHtml(r.target_path)}</span>
+									<span class="rel-target" onclick="App.queryPath('${r.target_path}')">${this.escapeHtml(r.target_path)}</span>
 								</div>
 							`).join('')}
 						</div>
@@ -218,7 +463,7 @@ const App = {
 		}
 		
 		// Files
-		if (node.files.length > 0) {
+		if (node.files && node.files.length > 0) {
 			html += `
 				<div class="panel">
 					<div class="panel-header">
@@ -246,13 +491,11 @@ const App = {
 			`;
 		}
 		
-		// Children for vaults
-		if (node.children.length > 0) {
+		// Children
+		if (node.children && node.children.length > 0) {
 			html += `
 				<div class="panel">
-					<div class="panel-header">
-						<span class="panel-title">Contents (${node.children.length})</span>
-					</div>
+					<div class="panel-header"><span class="panel-title">Contents (${node.children.length})</span></div>
 					<div class="panel-body">
 						<div class="children-list">
 							${node.children.map(c => `
@@ -268,13 +511,31 @@ const App = {
 			`;
 		}
 		
-		body.innerHTML = html || `
-			<div class="empty-message">
-				<div class="empty-icon">📋</div>
-				<div class="empty-title">Empty ${node.type.toLowerCase()}</div>
-				<div class="empty-text">This ${node.type.toLowerCase()} has no content yet.</div>
-			</div>
-		`;
+		if (body) {
+			body.innerHTML = html;
+		}
+	},
+	
+	/**
+	 * Close detail panel
+	 */
+	closeDetail() {
+		const panel = document.getElementById('detailPanel');
+		if (panel) {
+			panel.classList.add('hidden');
+		}
+		this.currentNode = null;
+	},
+	
+	/**
+	 * Query by path
+	 */
+	queryPath(path) {
+		const input = document.getElementById('queryInput');
+		if (input) {
+			input.value = `inside:${path}`;
+			this.executeQuery(input.value);
+		}
 	},
 	
 	/**
@@ -323,7 +584,6 @@ const App = {
 			
 			lightbox.classList.remove('hidden');
 		} else {
-			// Download
 			const a = document.createElement('a');
 			a.href = `/api/blobs/${hash}`;
 			a.download = name;
@@ -339,16 +599,6 @@ const App = {
 		if (lightbox) {
 			lightbox.classList.add('hidden');
 			document.getElementById('lightboxContent').innerHTML = '';
-		}
-	},
-	
-	/**
-	 * Navigate to a path
-	 */
-	navigateToPath(path) {
-		const node = this.nodes.find(n => n.path === path);
-		if (node) {
-			this.selectNode(node.uuid);
 		}
 	},
 	
@@ -391,7 +641,7 @@ const App = {
 			}
 			
 			document.getElementById('createNodeModal').classList.add('hidden');
-			await this.loadNodes();
+			this.executeQuery(document.getElementById('queryInput')?.value || '');
 			this.selectNode(data.uuid);
 		} catch (e) {
 			this.showError(e.message);
@@ -495,7 +745,6 @@ const App = {
 				}
 			}
 			
-			await this.loadNodes();
 			await this.selectNode(this.currentNode.uuid);
 		});
 		
@@ -522,18 +771,8 @@ const App = {
 				throw new Error(data.error || 'Failed to delete');
 			}
 			
-			this.currentNode = null;
-			await this.loadNodes();
-			
-			// Clear content area
-			document.getElementById('contentHeader').classList.add('hidden');
-			document.getElementById('contentBody').innerHTML = `
-				<div class="empty-message">
-					<div class="empty-icon">📂</div>
-					<div class="empty-title">Select an item</div>
-					<div class="empty-text">Choose a vault or record from the sidebar.</div>
-				</div>
-			`;
+			this.closeDetail();
+			this.executeQuery(document.getElementById('queryInput')?.value || '');
 		} catch (e) {
 			this.showError(e.message);
 		}
@@ -572,8 +811,9 @@ const App = {
 	 * Escape HTML
 	 */
 	escapeHtml(str) {
+		if (str === null || str === undefined) return '';
 		const div = document.createElement('div');
-		div.textContent = str;
+		div.textContent = String(str);
 		return div.innerHTML;
 	},
 	
@@ -587,7 +827,7 @@ const App = {
 
 // Initialize when DOM is ready
 document.addEventListener('DOMContentLoaded', () => {
-	if (document.getElementById('treeView')) {
+	if (document.getElementById('queryInput')) {
 		App.init();
 	}
 });

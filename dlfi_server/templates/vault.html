@@ -10,45 +10,40 @@
 {% endblock %}
 
 {% block header_right %}
+<button class="btn btn-sm btn-secondary" onclick="App.showCreateNode('VAULT')">+ Vault</button>
+<button class="btn btn-sm btn-secondary" onclick="App.showCreateNode('RECORD')">+ Record</button>
 <button class="btn btn-sm btn-secondary" onclick="App.exportStatic()">Export</button>
-<a href="/close" class="btn btn-sm btn-secondary">Close Vault</a>
+<a href="/close" class="btn btn-sm btn-secondary">Close</a>
 {% endblock %}
 
 {% block content %}
-<aside class="sidebar">
-	<div class="sidebar-header">
-		<span class="sidebar-title">Structure</span>
-		<div class="sidebar-actions">
-			<button class="btn btn-sm btn-secondary" onclick="App.showCreateNode('VAULT')" title="New Vault">📁+</button>
-			<button class="btn btn-sm btn-secondary" onclick="App.showCreateNode('RECORD')" title="New Record">📄+</button>
-		</div>
+<div class="query-bar">
+	<div class="query-input-wrapper">
+		<input type="text" 
+			id="queryInput" 
+			class="query-input" 
+			placeholder="Search... (type / to focus, ? for help)"
+			autocomplete="off"
+			spellcheck="false">
+		<div id="autocompleteDropdown" class="autocomplete-dropdown hidden"></div>
 	</div>
-	<div class="sidebar-body">
-		<div class="tree" id="treeView">
-			<div class="loading">
-				<div class="spinner"></div>
-			</div>
-		</div>
-	</div>
-</aside>
+	<button class="btn btn-secondary" id="queryHelpBtn" title="Query Help">?</button>
+</div>
 
-<section class="content">
-	<div id="contentHeader" class="content-header hidden">
-		<div class="breadcrumb" id="breadcrumb"></div>
-		<h2 class="content-title" id="contentTitle"></h2>
-		<div class="content-toolbar">
-			<button class="btn btn-sm btn-secondary" onclick="App.showEditMetadata()">Edit Metadata</button>
-			<button class="btn btn-sm btn-danger" onclick="App.deleteNode()">Delete</button>
+<div class="query-stats" id="queryStats">Loading...</div>
+
+<div class="results-container">
+	<div class="results-list-wrapper">
+		<div id="queryResults">
+			<div class="loading"><div class="spinner"></div></div>
 		</div>
 	</div>
-	<div class="content-body" id="contentBody">
-		<div class="empty-message">
-			<div class="empty-icon">📂</div>
-			<div class="empty-title">Select an item</div>
-			<div class="empty-text">Choose a vault or record from the sidebar to view its details.</div>
-		</div>
+	
+	<div id="detailPanel" class="detail-panel hidden">
+		<div class="detail-header" id="detailHeader"></div>
+		<div class="detail-body" id="detailBody"></div>
 	</div>
-</section>
+</div>
 
 <!-- Lightbox -->
 <div id="lightbox" class="lightbox hidden">
@@ -75,7 +70,7 @@
 			<div class="form-group">
 				<label class="form-label">Path</label>
 				<input type="text" id="createNodePath" class="form-input" placeholder="path/to/node">
-				<p class="form-hint">Full path including parent folders (will be created if needed)</p>
+				<p class="form-hint">Full path including parent folders</p>
 			</div>
 		</div>
 		<div class="modal-footer">
@@ -103,11 +98,25 @@
 		</div>
 	</div>
 </div>
+
+<!-- Query Help Modal -->
+<div id="queryHelpModal" class="modal-overlay hidden">
+	<div class="modal modal-xl">
+		<div class="modal-header">
+			<h2 class="modal-title">Query Syntax Help</h2>
+		</div>
+		<div class="modal-body" id="queryHelpContent">
+			<div class="loading"><div class="spinner"></div></div>
+		</div>
+		<div class="modal-footer">
+			<button class="btn btn-primary" onclick="document.getElementById('queryHelpModal').classList.add('hidden')">Close</button>
+		</div>
+	</div>
+</div>
 {% endblock %}
 
 {% block scripts %}
 <script>
-// Enter key handler for tag input
 document.getElementById('newTagInput')?.addEventListener('keypress', (e) => {
 	if (e.key === 'Enter') App.addTag();
 });
