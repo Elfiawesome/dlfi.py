@@ -21,51 +21,21 @@
 						<span class="section-title">Default Directory</span>
 						<span class="section-path">{{ default_dir }}</span>
 					</div>
-					{% if default_vaults %}
-					<div class="vault-list">
-						{% for vault in default_vaults %}
-						<div class="vault-item" onclick="openVault('{{ vault.path | e }}', {{ 'true' if vault.encrypted else 'false' }})">
-							<div class="vault-item-left">
-								<div class="vault-item-icon">📁</div>
-								<span class="vault-item-name">{{ vault.name }}</span>
-							</div>
-							{% if vault.encrypted %}
-							<span class="vault-item-badge">🔒</span>
-							{% endif %}
+					<div class="vault-list" id="defaultVaultsList">
+						<div class="vault-list-empty">
+							<p>No vaults in default directory</p>
 						</div>
-						{% endfor %}
 					</div>
-					{% else %}
-					<div class="vault-list-empty">
-						<p>No vaults in default directory</p>
-					</div>
-					{% endif %}
 				</div>
 				
 				<!-- Recent vaults from other locations -->
-				{% if recent_vaults %}
-				<div class="section">
+				<div class="section" id="recentVaultsSection" style="display: none;">
 					<div class="section-header">
 						<span class="section-title">Recent Vaults</span>
 					</div>
-					<div class="vault-list">
-						{% for vault in recent_vaults %}
-						<div class="vault-item" onclick="openVault('{{ vault.path | e }}', {{ 'true' if vault.encrypted else 'false' }})">
-							<div class="vault-item-left">
-								<div class="vault-item-icon">📁</div>
-								<div class="vault-item-info">
-									<span class="vault-item-name">{{ vault.name }}</span>
-									<span class="vault-item-path">{{ vault.path }}</span>
-								</div>
-							</div>
-							{% if vault.encrypted %}
-							<span class="vault-item-badge">🔒</span>
-							{% endif %}
-						</div>
-						{% endfor %}
+					<div class="vault-list" id="recentVaultsList">
 					</div>
 				</div>
-				{% endif %}
 			</div>
 			
 			<!-- Right Column: Open/Create -->
@@ -185,9 +155,23 @@
 
 {% block scripts %}
 <script>
+// Vault data passed safely as JSON - this preserves backslashes correctly
+const DEFAULT_VAULTS = {{ default_vaults | tojson }};
+const RECENT_VAULTS = {{ recent_vaults | tojson }};
+
 let pendingVaultPath = null;
 let browserMode = null;
 let browserCurrentPath = '';
+
+// Store browser items to avoid path escaping issues
+let browserItems = [];
+
+function escapeHtml(text) {
+	if (text === null || text === undefined) return '';
+	const div = document.createElement('div');
+	div.textContent = String(text);
+	return div.innerHTML;
+}
 
 function showAlert(message, type = 'error') {
 	const container = document.getElementById('alertContainer');
@@ -195,10 +179,59 @@ function showAlert(message, type = 'error') {
 	setTimeout(() => container.innerHTML = '', 5000);
 }
 
-function escapeHtml(text) {
-	const div = document.createElement('div');
-	div.textContent = text;
-	return div.innerHTML;
+// Render vault lists on page load
+function renderVaultLists() {
+	const defaultList = document.getElementById('defaultVaultsList');
+	const recentList = document.getElementById('recentVaultsList');
+	const recentSection = document.getElementById('recentVaultsSection');
+	
+	// Render default vaults
+	if (DEFAULT_VAULTS && DEFAULT_VAULTS.length > 0) {
+		defaultList.innerHTML = '';
+		DEFAULT_VAULTS.forEach((vault, index) => {
+			const item = document.createElement('div');
+			item.className = 'vault-item';
+			item.onclick = () => openVaultByIndex('default', index);
+			item.innerHTML = `
+				<div class="vault-item-left">
+					<div class="vault-item-icon">📁</div>
+					<span class="vault-item-name">${escapeHtml(vault.name)}</span>
+				</div>
+				${vault.encrypted ? '<span class="vault-item-badge">🔒</span>' : ''}
+			`;
+			defaultList.appendChild(item);
+		});
+	}
+	
+	// Render recent vaults
+	if (RECENT_VAULTS && RECENT_VAULTS.length > 0) {
+		recentSection.style.display = 'block';
+		recentList.innerHTML = '';
+		RECENT_VAULTS.forEach((vault, index) => {
+			const item = document.createElement('div');
+			item.className = 'vault-item';
+			item.onclick = () => openVaultByIndex('recent', index);
+			item.innerHTML = `
+				<div class="vault-item-left">
+					<div class="vault-item-icon">📁</div>
+					<div class="vault-item-info">
+						<span class="vault-item-name">${escapeHtml(vault.name)}</span>
+						<span class="vault-item-path">${escapeHtml(vault.path)}</span>
+					</div>
+				</div>
+				${vault.encrypted ? '<span class="vault-item-badge">🔒</span>' : ''}
+			`;
+			recentList.appendChild(item);
+		});
+	}
+}
+
+function openVaultByIndex(listType, index) {
+	const list = listType === 'default' ? DEFAULT_VAULTS : RECENT_VAULTS;
+	if (list && list[index]) {
+		const vault = list[index];
+		openVault(vault.path, vault.encrypted);
+	}
 }
 
 function toggleCreateMode() {
@@ -207,7 +240,7 @@ function toggleCreateMode() {
 	document.getElementById('createCustomMode').classList.toggle('hidden', useDefault);
 }
 
-async function openVault(path, encrypted) {
+function openVault(path, encrypted) {
 	console.log('Opening vault:', path, 'encrypted:', encrypted);
 	
 	if (encrypted) {
@@ -219,10 +252,10 @@ async function openVault(path, encrypted) {
 		return;
 	}
 	
-	await doOpenVault(path, null);
+	doOpenVault(path, null);
 }
 
-async function openVaultFromPath() {
+function openVaultFromPath() {
 	const path = document.getElementById('openVaultPath').value.trim();
 	const password = document.getElementById('openVaultPassword').value || null;
 	
@@ -231,7 +264,7 @@ async function openVaultFromPath() {
 		return;
 	}
 	
-	await doOpenVault(path, password);
+	doOpenVault(path, password);
 }
 
 async function doOpenVault(path, password) {
@@ -268,9 +301,9 @@ function closePasswordModal() {
 	pendingVaultPath = null;
 }
 
-async function submitPassword() {
+function submitPassword() {
 	const password = document.getElementById('vaultPassword').value || null;
-	await doOpenVault(pendingVaultPath, password);
+	doOpenVault(pendingVaultPath, password);
 }
 
 async function createVault() {
@@ -332,6 +365,9 @@ function closeBrowserModal() {
 }
 
 async function navigateTo(path) {
+	const list = document.getElementById('browserList');
+	list.innerHTML = '<div class="loading"><div class="spinner"></div></div>';
+	
 	try {
 		const resp = await fetch('/api/vault/browse', {
 			method: 'POST',
@@ -348,25 +384,39 @@ async function navigateTo(path) {
 		browserCurrentPath = data.current || '';
 		document.getElementById('browserCurrentPath').value = browserCurrentPath;
 		
-		const list = document.getElementById('browserList');
+		// Store items array for safe access
+		browserItems = data.items || [];
 		
-		if (!data.items || data.items.length === 0) {
+		if (browserItems.length === 0) {
 			list.innerHTML = '<div class="browser-empty">No items found</div>';
 			return;
 		}
 		
-		list.innerHTML = data.items.map(item => `
-			<div class="browser-item ${item.is_vault ? 'is-vault' : ''}" 
-				onclick="${item.is_dir ? `navigateTo('${item.path.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}')` : ''}">
+		// Build DOM elements to avoid escaping issues
+		list.innerHTML = '';
+		browserItems.forEach((item, index) => {
+			const div = document.createElement('div');
+			div.className = 'browser-item' + (item.is_vault ? ' is-vault' : '');
+			if (item.is_dir) {
+				div.onclick = () => navigateToIndex(index);
+			}
+			div.innerHTML = `
 				<span class="browser-item-icon">${item.is_dir ? '📁' : '📄'}</span>
 				<span class="browser-item-name">${escapeHtml(item.name)}</span>
 				${item.is_vault ? '<span class="browser-item-badge">VAULT</span>' : ''}
-			</div>
-		`).join('');
+			`;
+			list.appendChild(div);
+		});
 		
 	} catch (e) {
 		console.error('Browse error:', e);
-		showAlert(e.message);
+		list.innerHTML = `<div class="browser-empty">Error: ${escapeHtml(e.message)}</div>`;
+	}
+}
+
+function navigateToIndex(index) {
+	if (browserItems[index]) {
+		navigateTo(browserItems[index].path);
 	}
 }
 
@@ -383,24 +433,36 @@ function selectBrowserPath() {
 }
 
 // Enter key handlers
-document.getElementById('vaultPassword')?.addEventListener('keypress', (e) => {
-	if (e.key === 'Enter') submitPassword();
-});
-
-document.getElementById('openVaultPath')?.addEventListener('keypress', (e) => {
-	if (e.key === 'Enter') openVaultFromPath();
-});
-
-document.getElementById('newVaultName')?.addEventListener('keypress', (e) => {
-	if (e.key === 'Enter') createVault();
-});
-
-document.getElementById('newVaultPath')?.addEventListener('keypress', (e) => {
-	if (e.key === 'Enter') createVault();
-});
-
-document.getElementById('browserCurrentPath')?.addEventListener('keypress', (e) => {
-	if (e.key === 'Enter') navigateTo(e.target.value);
+document.addEventListener('DOMContentLoaded', () => {
+	renderVaultLists();
+	
+	document.getElementById('vaultPassword')?.addEventListener('keypress', (e) => {
+		if (e.key === 'Enter') submitPassword();
+	});
+	
+	document.getElementById('openVaultPath')?.addEventListener('keypress', (e) => {
+		if (e.key === 'Enter') openVaultFromPath();
+	});
+	
+	document.getElementById('openVaultPassword')?.addEventListener('keypress', (e) => {
+		if (e.key === 'Enter') openVaultFromPath();
+	});
+	
+	document.getElementById('newVaultName')?.addEventListener('keypress', (e) => {
+		if (e.key === 'Enter') createVault();
+	});
+	
+	document.getElementById('newVaultPath')?.addEventListener('keypress', (e) => {
+		if (e.key === 'Enter') createVault();
+	});
+	
+	document.getElementById('newVaultPassword')?.addEventListener('keypress', (e) => {
+		if (e.key === 'Enter') createVault();
+	});
+	
+	document.getElementById('browserCurrentPath')?.addEventListener('keypress', (e) => {
+		if (e.key === 'Enter') navigateTo(e.target.value);
+	});
 });
 </script>
 {% endblock %}

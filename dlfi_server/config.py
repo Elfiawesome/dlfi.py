@@ -2,6 +2,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List
 import os
+import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -19,7 +23,7 @@ class ServerConfig:
 		if self.default_vaults_dir is None:
 			self.default_vaults_dir = Path.cwd() / ".vaults"
 		elif isinstance(self.default_vaults_dir, str):
-			self.default_vaults_dir = Path(self.default_vaults_dir).resolve()
+			self.default_vaults_dir = Path(self.default_vaults_dir)
 		
 		# Ensure it's resolved
 		self.default_vaults_dir = self.default_vaults_dir.resolve()
@@ -45,7 +49,10 @@ class ServerConfig:
 					if not line:
 						continue
 					
-					path = Path(line)
+					try:
+						path = Path(line)
+					except Exception:
+						continue
 					
 					# Check if vault exists
 					if not path.exists() or not (path / ".dlfi").exists():
@@ -56,7 +63,6 @@ class ServerConfig:
 					config_path = path / ".dlfi" / "config.json"
 					if config_path.exists():
 						try:
-							import json
 							with open(config_path, 'r', encoding='utf-8') as cf:
 								vault_config = json.load(cf)
 								encrypted = vault_config.get("encrypted", False)
@@ -69,7 +75,7 @@ class ServerConfig:
 						"encrypted": encrypted
 					})
 		except Exception as e:
-			print(f"Error reading recent vaults: {e}")
+			logger.warning(f"Error reading recent vaults: {e}")
 			return []
 		
 		return result
@@ -77,8 +83,12 @@ class ServerConfig:
 	def add_recent_vault(self, vault_path: str):
 		"""Add a vault path to recent list."""
 		# Normalize the path
-		path = Path(vault_path).resolve()
-		path_str = str(path)
+		try:
+			path = Path(vault_path).resolve()
+			path_str = str(path)
+		except Exception as e:
+			logger.warning(f"Could not add recent vault: {e}")
+			return
 		
 		# Read existing entries
 		existing = []
@@ -108,4 +118,4 @@ class ServerConfig:
 			with open(self.recent_vaults_file, 'w', encoding='utf-8') as f:
 				f.write('\n'.join(existing))
 		except Exception as e:
-			print(f"Error saving recent vaults: {e}")
+			logger.warning(f"Error saving recent vaults: {e}")

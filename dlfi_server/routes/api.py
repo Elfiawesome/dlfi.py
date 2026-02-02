@@ -30,6 +30,44 @@ def require_vault(f):
 
 # ============ Vault Management ============
 
+def verify_vault_password(dlfi) -> bool:
+	"""
+	Verify the password is correct by attempting to decrypt something.
+	Returns True if password is valid or vault is not encrypted.
+	"""
+	if not dlfi.config.encrypted:
+		return True
+	
+	# Try to find a blob to decrypt
+	cursor = dlfi.conn.execute("SELECT hash FROM blobs LIMIT 1")
+	row = cursor.fetchone()
+	
+	if row:
+		# Try to read/decrypt a blob
+		try:
+			data = dlfi.read_blob(row[0])
+			return data is not None
+		except Exception as e:
+			logger.debug(f"Password verification failed: {e}")
+			return False
+	
+	# No blobs to verify against - check if there's an encrypted manifest
+	manifest_path = dlfi.root / "manifest.json"
+	if manifest_path.exists() and dlfi.crypto.enabled:
+		try:
+			with open(manifest_path, 'rb') as f:
+				encrypted_data = f.read()
+			# Try to decrypt - will fail with wrong password
+			dlfi.crypto.decrypt(encrypted_data)
+			return True
+		except Exception as e:
+			logger.debug(f"Manifest decryption failed: {e}")
+			return False
+	
+	# Nothing to verify against - assume correct (new empty vault)
+	return True
+
+
 @api_bp.route("/vault/open", methods=["POST"])
 def open_vault():
 	"""Open an existing vault from any path."""
@@ -59,6 +97,21 @@ def open_vault():
 	if not (vault_path / ".dlfi").exists():
 		return jsonify({"error": "Not a valid DLFI vault (no .dlfi folder found)"}), 400
 	
+	# Check if vault is encrypted and password is needed
+	config_path = vault_path / ".dlfi" / "config.json"
+	vault_encrypted = False
+	if config_path.exists():
+		try:
+			with open(config_path, 'r', encoding='utf-8') as f:
+				import json as json_module
+				vault_config = json_module.load(f)
+				vault_encrypted = vault_config.get("encrypted", False)
+		except:
+			pass
+	
+	if vault_encrypted and not password:
+		return jsonify({"error": "Password required for encrypted vault"}), 401
+	
 	# Close existing vault if open
 	existing = current_app.config.get("DLFI_INSTANCE")
 	if existing:
@@ -70,6 +123,13 @@ def open_vault():
 	
 	try:
 		dlfi = DLFI(str(vault_path), password=password)
+		
+		# Verify password is correct by trying to decrypt something
+		if dlfi.config.encrypted:
+			if not verify_vault_password(dlfi):
+				dlfi.close()
+				return jsonify({"error": "Incorrect password"}), 401
+		
 		current_app.config["DLFI_INSTANCE"] = dlfi
 		current_app.config["DLFI_PASSWORD"] = password
 		
@@ -218,7 +278,10 @@ def browse_path():
 		else:
 			path = "/"
 	
-	current = Path(path).resolve()
+	try:
+		current = Path(path).resolve()
+	except Exception as e:
+		return jsonify({"error": f"Invalid path: {e}"}), 400
 	
 	if not current.exists():
 		return jsonify({"error": "Path does not exist"}), 404
