@@ -32,6 +32,7 @@ class Suggestion:
 	type: SuggestionType
 	description: str = ""
 	insert_text: str = ""  # What to actually insert (may differ from text)
+	section: str = ""      # Section grouping
 	
 	def to_dict(self) -> Dict[str, Any]:
 		return {
@@ -39,7 +40,8 @@ class Suggestion:
 			"display": self.display,
 			"type": self.type.name.lower(),
 			"description": self.description,
-			"insert_text": self.insert_text or self.text
+			"insert_text": self.insert_text or self.text,
+			"section": self.section
 		}
 
 
@@ -47,36 +49,25 @@ class AutocompleteProvider:
 	"""Provides autocomplete suggestions for queries."""
 	
 	# Query language keywords with descriptions
-	KEYWORDS = {
-		'tag': ('tag:', 'Search by tag', 'tag:'),
-		'inside': ('inside:', 'Search within a path', 'inside:'),
-		'path': ('path:', 'Match path pattern', 'path:'),
-		'ext': ('ext:', 'Filter by file extension', 'ext:'),
-		'files': ('files', 'Filter by file count', 'files'),
-		'size': ('size', 'Filter by total size', 'size'),
-		'type': ('type:', 'Filter by node type', 'type:'),
-		'limit': ('limit:', 'Limit number of results', 'limit:'),
-		'sort': ('sort:', 'Sort results', 'sort:'),
-		'preview': ('preview:', 'Filter by preview availability', 'preview:'),
-	}
-	
-	# Operators
-	OPERATORS = [
-		(':', 'contains (partial match)'),
-		('=', 'equals (exact match)'),
-		('>', 'greater than'),
-		('<', 'less than'),
-		('>=', 'greater than or equal'),
-		('<=', 'less than or equal'),
-		('..', 'range (e.g., 2020..2024)'),
+	KEYWORDS = [
+		('tag:', 'Filter by tag', 'Tags'),
+		('inside:', 'Search within path', 'Structure'),
+		('path:', 'Match path pattern', 'Structure'),
+		('ext:', 'Filter by file extension', 'Files'),
+		('files>', 'Filter by file count (>, <, =)', 'Files'),
+		('size>', 'Filter by size (e.g., size>10mb)', 'Files'),
+		('type:', 'Filter by VAULT or RECORD', 'Filters'),
+		('limit:', 'Limit number of results', 'Modifiers'),
+		('sort:', 'Sort results (name, path, created, modified)', 'Modifiers'),
+		('preview:', 'Has visual preview (true/false)', 'Files'),
 	]
 	
 	# Modifiers
 	MODIFIERS = [
-		('-', 'Negate/exclude'),
-		('^', 'Deep search (include descendants)'),
-		('%', 'Reverse deep (include ancestors)'),
-		('!', 'Relationship query'),
+		('-', 'Negate/exclude the next term', 'Modifiers'),
+		('^', 'Deep search - include descendants', 'Modifiers'),
+		('%', 'Reverse deep - include ancestors', 'Modifiers'),
+		('!', 'Relationship query (e.g., !path:RELATION)', 'Relationships'),
 	]
 	
 	# Sort options
@@ -86,12 +77,10 @@ class AutocompleteProvider:
 		self.dlfi = dlfi_instance
 		self.conn = dlfi_instance.conn
 		self._cache = {}
-		self._cache_valid = False
 	
 	def invalidate_cache(self):
 		"""Invalidate the autocomplete cache."""
 		self._cache = {}
-		self._cache_valid = False
 	
 	def get_suggestions(self, query: str, cursor_pos: int = None) -> List[Dict]:
 		"""
@@ -105,121 +94,179 @@ class AutocompleteProvider:
 			cursor_pos = len(query)
 		
 		# Get the text before cursor
-		text_before = query[:cursor_pos]
+		text_before = query[:cursor_pos].rstrip()
 		
 		# Determine context
 		context = self._analyze_context(text_before)
 		
 		suggestions = []
 		
-		if context['type'] == 'start':
+		if context['type'] == 'empty':
+			suggestions = self._suggest_initial()
+		
+		elif context['type'] == 'start':
 			suggestions = self._suggest_start(context['prefix'])
 		
-		elif context['type'] == 'after_keyword':
-			suggestions = self._suggest_for_keyword(context['keyword'], context['prefix'])
+		elif context['type'] == 'keyword_partial':
+			suggestions = self._suggest_keywords(context['prefix'])
+		
+		elif context['type'] == 'after_colon':
+			suggestions = self._suggest_value(context['key'], ':', context['prefix'])
+		
+		elif context['type'] == 'after_equals':
+			suggestions = self._suggest_value(context['key'], '=', context['prefix'])
 		
 		elif context['type'] == 'after_operator':
 			suggestions = self._suggest_value(context['key'], context['operator'], context['prefix'])
 		
-		elif context['type'] == 'after_relation':
-			suggestions = self._suggest_relation(context['path'], context['prefix'])
+		elif context['type'] == 'relation_path':
+			suggestions = self._suggest_paths(context['prefix'], for_relation=True)
 		
-		elif context['type'] == 'path':
-			suggestions = self._suggest_path(context['prefix'])
+		elif context['type'] == 'relation_type':
+			suggestions = self._suggest_relations(context['prefix'])
 		
 		# Convert to dicts and return
-		return [s.to_dict() for s in suggestions[:20]]  # Limit to 20 suggestions
+		return [s.to_dict() for s in suggestions[:25]]
 	
 	def _analyze_context(self, text: str) -> Dict[str, Any]:
 		"""Analyze the text to determine the autocomplete context."""
-		text = text.rstrip()
+		# Empty query
+		if not text:
+			return {'type': 'empty'}
 		
-		# Empty or just started
-		if not text or text.endswith(' ') or text.endswith('|') or text.endswith('('):
-			return {'type': 'start', 'prefix': ''}
+		# Check if we just typed a space, |, or (
+		if text[-1] in ' |(':
+			return {'type': 'empty'}
 		
-		# Find the current "word" being typed
-		# Split by spaces, parens, and pipes
-		parts = re.split(r'[\s|()]+', text)
-		current = parts[-1] if parts else ''
+		# Find the current token being typed
+		# Split by spaces, but keep track of position
+		tokens = re.split(r'([\s|()]+)', text)
+		current_token = ''
+		for t in reversed(tokens):
+			if t and not re.match(r'^[\s|()]+$', t):
+				current_token = t
+				break
+		
+		if not current_token:
+			return {'type': 'empty'}
 		
 		# Check for relation prefix !
-		if current.startswith('!'):
-			path_part = current[1:]
+		if current_token.startswith('!'):
+			path_part = current_token[1:]
 			if ':' in path_part:
+				# After !path: - suggest relation types
 				path, rel_prefix = path_part.rsplit(':', 1)
-				return {'type': 'after_relation', 'path': path, 'prefix': rel_prefix}
-			return {'type': 'path', 'prefix': path_part, 'for_relation': True}
+				return {'type': 'relation_type', 'path': path, 'prefix': rel_prefix}
+			# Still typing path
+			return {'type': 'relation_path', 'prefix': path_part}
 		
-		# Check for modifiers at start
-		prefix_mods = ''
-		while current and current[0] in '-^%':
-			prefix_mods += current[0]
-			current = current[1:]
+		# Strip leading modifiers for analysis
+		clean_token = current_token.lstrip('-^%')
 		
-		# Check for keyword:value pattern
-		if ':' in current:
-			key, value = current.split(':', 1)
-			return {'type': 'after_operator', 'key': key.lower(), 'operator': ':', 'prefix': value}
+		# Check for key:value or key=value
+		for op in [':', '=', '>=', '<=', '>', '<']:
+			if op in clean_token:
+				parts = clean_token.split(op, 1)
+				key = parts[0]
+				value = parts[1] if len(parts) > 1 else ''
+				return {
+					'type': 'after_colon' if op == ':' else ('after_equals' if op == '=' else 'after_operator'),
+					'key': key.lower(),
+					'operator': op,
+					'prefix': value
+				}
 		
-		if '=' in current:
-			key, value = current.split('=', 1)
-			return {'type': 'after_operator', 'key': key.lower(), 'operator': '=', 'prefix': value}
+		# Check if it looks like a partial keyword
+		if clean_token and any(kw[0].startswith(clean_token.lower()) for kw in self.KEYWORDS):
+			return {'type': 'keyword_partial', 'prefix': clean_token}
 		
-		# Check for comparison operators
-		for op in ['>=', '<=', '>', '<']:
-			if op in current:
-				key, value = current.split(op, 1)
-				return {'type': 'after_operator', 'key': key.lower(), 'operator': op, 'prefix': value}
+		# General start - could be keyword, metadata key, or search term
+		return {'type': 'start', 'prefix': clean_token}
+	
+	def _suggest_initial(self) -> List[Suggestion]:
+		"""Suggest keywords and modifiers when starting fresh."""
+		suggestions = []
 		
-		# Check if typing a known keyword
-		current_lower = current.lower()
-		for keyword in self.KEYWORDS:
-			if keyword.startswith(current_lower):
-				return {'type': 'after_keyword', 'keyword': keyword, 'prefix': current}
+		# Add modifiers first
+		for mod, desc, section in self.MODIFIERS:
+			suggestions.append(Suggestion(
+				text=mod,
+				display=mod,
+				type=SuggestionType.MODIFIER,
+				description=desc,
+				insert_text=mod,
+				section=section
+			))
 		
-		# Default to start context
-		return {'type': 'start', 'prefix': current}
+		# Add keywords
+		for kw, desc, section in self.KEYWORDS:
+			suggestions.append(Suggestion(
+				text=kw,
+				display=kw,
+				type=SuggestionType.KEYWORD,
+				description=desc,
+				insert_text=kw,
+				section=section
+			))
+		
+		# Add common metadata keys
+		meta_keys = self._get_metadata_keys()[:10]
+		for key in meta_keys:
+			suggestions.append(Suggestion(
+				text=f"{key}:",
+				display=f"{key}:",
+				type=SuggestionType.METADATA_KEY,
+				description="Metadata field",
+				insert_text=f"{key}:",
+				section="Metadata"
+			))
+		
+		return suggestions
 	
 	def _suggest_start(self, prefix: str) -> List[Suggestion]:
-		"""Suggest keywords and modifiers at the start of a term."""
+		"""Suggest keywords and metadata keys matching prefix."""
 		suggestions = []
 		prefix_lower = prefix.lower()
 		
-		# Suggest modifiers if at very start
-		if not prefix:
-			for mod, desc in self.MODIFIERS:
+		# Match keywords
+		for kw, desc, section in self.KEYWORDS:
+			kw_name = kw.rstrip(':>=<')
+			if kw_name.startswith(prefix_lower):
+				suggestions.append(Suggestion(
+					text=kw,
+					display=kw,
+					type=SuggestionType.KEYWORD,
+					description=desc,
+					insert_text=kw,
+					section=section
+				))
+		
+		# Match modifiers
+		for mod, desc, section in self.MODIFIERS:
+			if mod.startswith(prefix_lower):
 				suggestions.append(Suggestion(
 					text=mod,
 					display=mod,
 					type=SuggestionType.MODIFIER,
-					description=desc
-				))
-		
-		# Suggest keywords
-		for keyword, (display, desc, insert) in self.KEYWORDS.items():
-			if keyword.startswith(prefix_lower) or not prefix:
-				suggestions.append(Suggestion(
-					text=keyword,
-					display=display,
-					type=SuggestionType.KEYWORD,
 					description=desc,
-					insert_text=insert
+					insert_text=mod,
+					section=section
 				))
 		
-		# Suggest common metadata keys
+		# Match metadata keys
 		meta_keys = self._get_metadata_keys()
 		for key in meta_keys:
 			if key.lower().startswith(prefix_lower):
 				suggestions.append(Suggestion(
-					text=key,
+					text=f"{key}:",
 					display=f"{key}:",
 					type=SuggestionType.METADATA_KEY,
-					description=f"Metadata field",
-					insert_text=f"{key}:"
+					description="Metadata field",
+					insert_text=f"{key}:",
+					section="Metadata"
 				))
 		
-		# Suggest tags
+		# Match tags with tag: prefix
 		tags = self._get_all_tags()
 		for tag in tags:
 			if tag.startswith(prefix_lower):
@@ -227,153 +274,203 @@ class AutocompleteProvider:
 					text=f"tag:{tag}",
 					display=f"tag:{tag}",
 					type=SuggestionType.TAG,
-					description="Tag"
+					description="Tag",
+					insert_text=f"tag:{tag}",
+					section="Tags"
 				))
 		
 		return suggestions
 	
-	def _suggest_for_keyword(self, keyword: str, prefix: str) -> List[Suggestion]:
-		"""Suggest completions for a partially typed keyword."""
+	def _suggest_keywords(self, prefix: str) -> List[Suggestion]:
+		"""Suggest keywords matching the prefix."""
 		suggestions = []
 		prefix_lower = prefix.lower()
 		
-		for kw, (display, desc, insert) in self.KEYWORDS.items():
-			if kw.startswith(prefix_lower):
+		for kw, desc, section in self.KEYWORDS:
+			kw_name = kw.rstrip(':>=<')
+			if kw_name.startswith(prefix_lower):
 				suggestions.append(Suggestion(
 					text=kw,
-					display=display,
+					display=kw,
 					type=SuggestionType.KEYWORD,
 					description=desc,
-					insert_text=insert
+					insert_text=kw,
+					section=section
 				))
 		
 		return suggestions
 	
 	def _suggest_value(self, key: str, operator: str, prefix: str) -> List[Suggestion]:
-		"""Suggest values for a key:value expression."""
+		"""Suggest values for a key:value or key=value expression."""
 		suggestions = []
 		prefix_lower = prefix.lower()
+		key_lower = key.lower()
 		
-		if key == 'tag':
+		if key_lower == 'tag':
 			tags = self._get_all_tags()
 			for tag in tags:
-				if tag.startswith(prefix_lower) or not prefix:
+				if not prefix or tag.startswith(prefix_lower):
 					suggestions.append(Suggestion(
 						text=tag,
 						display=tag,
 						type=SuggestionType.TAG,
-						description="Tag"
+						description="Tag",
+						insert_text=tag,
+						section="Tags"
 					))
 		
-		elif key == 'type':
+		elif key_lower == 'type':
 			for t in ['VAULT', 'RECORD']:
-				if t.lower().startswith(prefix_lower) or not prefix:
+				if not prefix or t.lower().startswith(prefix_lower):
 					suggestions.append(Suggestion(
 						text=t,
 						display=t,
 						type=SuggestionType.NODE_TYPE,
-						description="Node type"
+						description="Node type",
+						insert_text=t,
+						section="Types"
 					))
 		
-		elif key == 'ext':
+		elif key_lower == 'ext':
 			extensions = self._get_all_extensions()
 			for ext in extensions:
-				if ext.startswith(prefix_lower) or not prefix:
+				if not prefix or ext.startswith(prefix_lower):
 					suggestions.append(Suggestion(
 						text=ext,
 						display=ext,
 						type=SuggestionType.EXTENSION,
-						description="File extension"
+						description="File extension",
+						insert_text=ext,
+						section="Extensions"
 					))
 		
-		elif key == 'inside' or key == 'path':
+		elif key_lower in ('inside', 'path'):
 			paths = self._get_all_paths()
 			for path in paths:
-				if path.lower().startswith(prefix_lower) or not prefix:
+				if not prefix or path.lower().startswith(prefix_lower):
 					suggestions.append(Suggestion(
 						text=path,
 						display=path,
 						type=SuggestionType.PATH,
-						description="Path"
+						description="Path",
+						insert_text=path,
+						section="Paths"
 					))
 		
-		elif key == 'sort':
+		elif key_lower == 'sort':
 			for opt in self.SORT_OPTIONS:
-				if opt.startswith(prefix_lower) or not prefix:
+				if not prefix or opt.startswith(prefix_lower):
+					desc = "Descending" if opt.startswith('-') else "Ascending"
 					suggestions.append(Suggestion(
 						text=opt,
 						display=opt,
 						type=SuggestionType.KEYWORD,
-						description="Sort order"
+						description=desc,
+						insert_text=opt,
+						section="Sort"
 					))
 		
-		elif key == 'preview':
+		elif key_lower == 'preview':
 			for val in ['true', 'false']:
-				if val.startswith(prefix_lower) or not prefix:
+				if not prefix or val.startswith(prefix_lower):
 					suggestions.append(Suggestion(
 						text=val,
 						display=val,
 						type=SuggestionType.KEYWORD,
-						description="Has preview"
+						description="Has preview" if val == 'true' else "No preview",
+						insert_text=val,
+						section="Values"
 					))
 		
-		elif key in ('size', 'files', 'limit'):
+		elif key_lower == 'size':
+			sizes = ['1kb', '10kb', '100kb', '1mb', '10mb', '100mb', '1gb']
+			for size in sizes:
+				if not prefix or size.startswith(prefix_lower):
+					suggestions.append(Suggestion(
+						text=size,
+						display=size,
+						type=SuggestionType.KEYWORD,
+						description="Size",
+						insert_text=size,
+						section="Sizes"
+					))
+		
+		elif key_lower in ('files', 'limit'):
 			# Numeric suggestions
-			if key == 'size':
-				for size in ['1mb', '10mb', '100mb', '1gb']:
-					if size.startswith(prefix_lower) or not prefix:
-						suggestions.append(Suggestion(
-							text=size,
-							display=size,
-							type=SuggestionType.KEYWORD,
-							description="Size"
-						))
+			for num in ['1', '5', '10', '25', '50', '100']:
+				if not prefix or num.startswith(prefix):
+					suggestions.append(Suggestion(
+						text=num,
+						display=num,
+						type=SuggestionType.KEYWORD,
+						description="",
+						insert_text=num,
+						section="Numbers"
+					))
 		
 		else:
-			# It's a metadata key - suggest values
+			# It's a metadata key - suggest values for this key
 			values = self._get_metadata_values(key)
 			for val in values:
 				val_str = str(val)
-				if val_str.lower().startswith(prefix_lower) or not prefix:
+				if not prefix or val_str.lower().startswith(prefix_lower):
 					suggestions.append(Suggestion(
 						text=val_str,
 						display=val_str,
 						type=SuggestionType.METADATA_VALUE,
-						description=f"{key} value"
+						description=f"{key} value",
+						insert_text=val_str if ' ' not in val_str else f'"{val_str}"',
+						section="Values"
 					))
 		
 		return suggestions
 	
-	def _suggest_relation(self, path: str, prefix: str) -> List[Suggestion]:
-		"""Suggest relation types."""
-		relations = self._get_all_relations()
-		prefix_upper = prefix.upper()
-		
+	def _suggest_paths(self, prefix: str, for_relation: bool = False) -> List[Suggestion]:
+		"""Suggest paths."""
 		suggestions = []
-		for rel in relations:
-			if rel.startswith(prefix_upper) or not prefix:
-				suggestions.append(Suggestion(
-					text=rel,
-					display=rel,
-					type=SuggestionType.RELATION,
-					description="Relationship type"
-				))
-		
-		return suggestions
-	
-	def _suggest_path(self, prefix: str) -> List[Suggestion]:
-		"""Suggest paths for relation queries."""
-		paths = self._get_all_paths()
 		prefix_lower = prefix.lower()
+		paths = self._get_all_paths()
 		
-		suggestions = []
 		for path in paths:
-			if path.lower().startswith(prefix_lower) or not prefix:
+			if not prefix or path.lower().startswith(prefix_lower):
 				suggestions.append(Suggestion(
 					text=path,
 					display=path,
 					type=SuggestionType.PATH,
-					description="Node path"
+					description="Node path",
+					insert_text=path + (':' if for_relation else ''),
+					section="Paths"
+				))
+		
+		return suggestions
+	
+	def _suggest_relations(self, prefix: str) -> List[Suggestion]:
+		"""Suggest relation types."""
+		suggestions = []
+		prefix_upper = prefix.upper()
+		relations = self._get_all_relations()
+		
+		for rel in relations:
+			if not prefix or rel.startswith(prefix_upper):
+				suggestions.append(Suggestion(
+					text=rel,
+					display=rel,
+					type=SuggestionType.RELATION,
+					description="Relationship type",
+					insert_text=rel,
+					section="Relations"
+				))
+		
+		# Add direction hints
+		if prefix:
+			for direction, desc in [('>', 'Outgoing only'), ('<', 'Incoming only')]:
+				suggestions.append(Suggestion(
+					text=prefix + direction,
+					display=prefix + direction,
+					type=SuggestionType.OPERATOR,
+					description=desc,
+					insert_text=prefix + direction,
+					section="Direction"
 				))
 		
 		return suggestions
@@ -383,28 +480,28 @@ class AutocompleteProvider:
 	def _get_all_tags(self) -> List[str]:
 		"""Get all unique tags."""
 		if 'tags' not in self._cache:
-			cursor = self.conn.execute("SELECT DISTINCT tag FROM tags ORDER BY tag")
+			cursor = self.conn.execute("SELECT DISTINCT tag FROM tags ORDER BY tag LIMIT 100")
 			self._cache['tags'] = [row[0] for row in cursor]
 		return self._cache['tags']
 	
 	def _get_all_extensions(self) -> List[str]:
 		"""Get all unique file extensions."""
 		if 'extensions' not in self._cache:
-			cursor = self.conn.execute("SELECT DISTINCT ext FROM blobs WHERE ext IS NOT NULL ORDER BY ext")
+			cursor = self.conn.execute("SELECT DISTINCT ext FROM blobs WHERE ext IS NOT NULL AND ext != '' ORDER BY ext LIMIT 50")
 			self._cache['extensions'] = [row[0] for row in cursor]
 		return self._cache['extensions']
 	
 	def _get_all_paths(self) -> List[str]:
 		"""Get all node paths."""
 		if 'paths' not in self._cache:
-			cursor = self.conn.execute("SELECT cached_path FROM nodes ORDER BY cached_path")
+			cursor = self.conn.execute("SELECT cached_path FROM nodes ORDER BY cached_path LIMIT 200")
 			self._cache['paths'] = [row[0] for row in cursor]
 		return self._cache['paths']
 	
 	def _get_all_relations(self) -> List[str]:
 		"""Get all unique relation types."""
 		if 'relations' not in self._cache:
-			cursor = self.conn.execute("SELECT DISTINCT relation FROM edges ORDER BY relation")
+			cursor = self.conn.execute("SELECT DISTINCT relation FROM edges ORDER BY relation LIMIT 50")
 			self._cache['relations'] = [row[0] for row in cursor]
 		return self._cache['relations']
 	
@@ -412,7 +509,7 @@ class AutocompleteProvider:
 		"""Get all unique metadata keys."""
 		if 'meta_keys' not in self._cache:
 			keys = set()
-			cursor = self.conn.execute("SELECT metadata FROM nodes WHERE metadata IS NOT NULL")
+			cursor = self.conn.execute("SELECT metadata FROM nodes WHERE metadata IS NOT NULL AND metadata != '{}' LIMIT 500")
 			for row in cursor:
 				try:
 					meta = json.loads(row[0])
@@ -420,7 +517,7 @@ class AutocompleteProvider:
 						keys.update(meta.keys())
 				except:
 					pass
-			self._cache['meta_keys'] = sorted(keys)
+			self._cache['meta_keys'] = sorted(keys)[:50]
 		return self._cache['meta_keys']
 	
 	def _get_metadata_values(self, key: str) -> List[Any]:
@@ -428,7 +525,7 @@ class AutocompleteProvider:
 		cache_key = f'meta_values_{key}'
 		if cache_key not in self._cache:
 			values = set()
-			cursor = self.conn.execute("SELECT metadata FROM nodes WHERE metadata IS NOT NULL")
+			cursor = self.conn.execute("SELECT metadata FROM nodes WHERE metadata IS NOT NULL LIMIT 500")
 			for row in cursor:
 				try:
 					meta = json.loads(row[0])
@@ -438,5 +535,5 @@ class AutocompleteProvider:
 							values.add(val)
 				except:
 					pass
-			self._cache[cache_key] = sorted(values, key=str)[:50]  # Limit to 50 values
+			self._cache[cache_key] = sorted(values, key=lambda x: str(x))[:50]
 		return self._cache[cache_key]

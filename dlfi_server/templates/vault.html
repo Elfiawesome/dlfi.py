@@ -17,31 +17,51 @@
 {% endblock %}
 
 {% block content %}
-<div class="query-bar">
-	<div class="query-input-wrapper">
-		<input type="text" 
-			id="queryInput" 
-			class="query-input" 
-			placeholder="Search... (type / to focus, ? for help)"
-			autocomplete="off"
-			spellcheck="false">
-		<div id="autocompleteDropdown" class="autocomplete-dropdown hidden"></div>
-	</div>
-	<button class="btn btn-secondary" id="queryHelpBtn" title="Query Help">?</button>
-</div>
-
-<div class="query-stats" id="queryStats">Loading...</div>
-
-<div class="results-container">
-	<div class="results-list-wrapper">
-		<div id="queryResults">
-			<div class="loading"><div class="spinner"></div></div>
+<div class="vault-wrapper">
+	<!-- Query Bar at Top -->
+	<div class="query-bar">
+		<div class="query-input-wrapper">
+			<input type="text" 
+				id="queryInput" 
+				class="query-input" 
+				placeholder="Search... (press / to focus, click ? for help)"
+				autocomplete="off"
+				spellcheck="false">
+			<div id="autocompleteDropdown" class="autocomplete-dropdown hidden"></div>
 		</div>
+		<button class="btn btn-secondary" id="queryHelpBtn" title="Query Help">?</button>
 	</div>
 	
-	<div id="detailPanel" class="detail-panel hidden">
-		<div class="detail-header" id="detailHeader"></div>
-		<div class="detail-body" id="detailBody"></div>
+	<!-- Main Layout: Sidebar + Results -->
+	<div class="vault-body">
+		<!-- Sidebar with Tree -->
+		<aside class="sidebar">
+			<div class="sidebar-header">
+				<span class="sidebar-title">Structure</span>
+				<button class="btn btn-sm btn-secondary" onclick="App.refreshTree()" title="Refresh">↻</button>
+			</div>
+			<div class="sidebar-body">
+				<div class="tree" id="treeView">
+					<div class="loading"><div class="spinner"></div></div>
+				</div>
+			</div>
+		</aside>
+		
+		<!-- Results Area -->
+		<div class="results-area">
+			<div class="query-stats" id="queryStats">Loading...</div>
+			
+			<div class="results-container">
+				<div class="results-list-wrapper" id="queryResults">
+					<div class="loading"><div class="spinner"></div></div>
+				</div>
+				
+				<div id="detailPanel" class="detail-panel hidden">
+					<div class="detail-header" id="detailHeader"></div>
+					<div class="detail-body" id="detailBody"></div>
+				</div>
+			</div>
+		</div>
 	</div>
 </div>
 

@@ -5,8 +5,10 @@
 const App = {
 	currentNode: null,
 	nodes: [],
+	treeNodes: [],
 	queryResults: [],
 	autocompleteTimeout: null,
+	autocompleteIndex: -1,
 	
 	/**
 	 * Initialize the application
@@ -14,7 +16,10 @@ const App = {
 	async init() {
 		this.bindEvents();
 		this.initQueryInput();
-		await this.executeQuery('');  // Load all nodes initially
+		await Promise.all([
+			this.loadTree(),
+			this.executeQuery('')
+		]);
 	},
 	
 	/**
@@ -52,7 +57,7 @@ const App = {
 			}
 			
 			// Focus search with /
-			if (e.key === '/' && document.activeElement.tagName !== 'INPUT') {
+			if (e.key === '/' && document.activeElement.tagName !== 'INPUT' && document.activeElement.tagName !== 'TEXTAREA') {
 				e.preventDefault();
 				document.getElementById('queryInput')?.focus();
 			}
@@ -64,34 +69,52 @@ const App = {
 	 */
 	initQueryInput() {
 		const input = document.getElementById('queryInput');
-		const autocomplete = document.getElementById('autocompleteDropdown');
 		
 		if (!input) return;
+		
+		// Show autocomplete on focus (even if empty)
+		input.addEventListener('focus', () => {
+			clearTimeout(this.autocompleteTimeout);
+			this.autocompleteTimeout = setTimeout(() => {
+				this.fetchAutocomplete(input.value, input.selectionStart);
+			}, 50);
+		});
 		
 		// Input handler with debounce for autocomplete
 		input.addEventListener('input', (e) => {
 			clearTimeout(this.autocompleteTimeout);
 			this.autocompleteTimeout = setTimeout(() => {
 				this.fetchAutocomplete(e.target.value, e.target.selectionStart);
-			}, 150);
+			}, 100);
 		});
 		
-		// Execute query on Enter
+		// Handle keyboard navigation
 		input.addEventListener('keydown', (e) => {
-			if (e.key === 'Enter' && !e.shiftKey) {
-				e.preventDefault();
-				this.hideAutocomplete();
-				this.executeQuery(input.value);
-			}
+			const dropdown = document.getElementById('autocompleteDropdown');
+			const isDropdownVisible = dropdown && !dropdown.classList.contains('hidden');
 			
-			// Navigate autocomplete
-			if (e.key === 'ArrowDown') {
+			if (e.key === 'Enter') {
+				if (isDropdownVisible && this.autocompleteIndex >= 0) {
+					e.preventDefault();
+					this.selectAutocomplete();
+				} else {
+					e.preventDefault();
+					this.hideAutocomplete();
+					this.executeQuery(input.value);
+				}
+			} else if (e.key === 'ArrowDown') {
 				e.preventDefault();
-				this.navigateAutocomplete(1);
+				if (!isDropdownVisible) {
+					this.fetchAutocomplete(input.value, input.selectionStart);
+				} else {
+					this.navigateAutocomplete(1);
+				}
 			} else if (e.key === 'ArrowUp') {
-				e.preventDefault();
-				this.navigateAutocomplete(-1);
-			} else if (e.key === 'Tab' && autocomplete && !autocomplete.classList.contains('hidden')) {
+				if (isDropdownVisible) {
+					e.preventDefault();
+					this.navigateAutocomplete(-1);
+				}
+			} else if (e.key === 'Tab' && isDropdownVisible) {
 				e.preventDefault();
 				this.selectAutocomplete();
 			} else if (e.key === 'Escape') {
@@ -99,12 +122,12 @@ const App = {
 			}
 		});
 		
-		// Hide autocomplete on blur (with delay for click handling)
+		// Hide on blur with delay
 		input.addEventListener('blur', () => {
-			setTimeout(() => this.hideAutocomplete(), 200);
+			setTimeout(() => this.hideAutocomplete(), 150);
 		});
 		
-		// Show help button
+		// Help button
 		document.getElementById('queryHelpBtn')?.addEventListener('click', () => {
 			this.showQueryHelp();
 		});
@@ -114,48 +137,88 @@ const App = {
 	 * Fetch autocomplete suggestions
 	 */
 	async fetchAutocomplete(query, cursorPos) {
-		if (!query) {
-			this.hideAutocomplete();
-			return;
-		}
-		
 		try {
-			const resp = await fetch(`/api/autocomplete?q=${encodeURIComponent(query)}&cursor=${cursorPos}`);
-			if (!resp.ok) return;
+			const params = new URLSearchParams({
+				q: query || '',
+				cursor: (cursorPos || 0).toString()
+			});
+			
+			const resp = await fetch(`/api/autocomplete?${params}`);
+			if (!resp.ok) {
+				console.error('Autocomplete request failed:', resp.status);
+				return;
+			}
 			
 			const data = await resp.json();
-			this.showAutocomplete(data.suggestions);
+			
+			if (data.suggestions && data.suggestions.length > 0) {
+				this.showAutocomplete(data.suggestions);
+			} else {
+				this.hideAutocomplete();
+			}
 		} catch (e) {
 			console.error('Autocomplete failed:', e);
 		}
 	},
 	
+
 	/**
 	 * Show autocomplete dropdown
 	 */
 	showAutocomplete(suggestions) {
 		const dropdown = document.getElementById('autocompleteDropdown');
-		if (!dropdown || !suggestions.length) {
+		if (!dropdown) return;
+		
+		if (!suggestions || !suggestions.length) {
 			this.hideAutocomplete();
 			return;
 		}
 		
-		dropdown.innerHTML = suggestions.map((s, i) => `
-			<div class="autocomplete-item ${i === 0 ? 'active' : ''}" 
-				data-index="${i}"
-				data-insert="${this.escapeHtml(s.insert_text)}">
-				<span class="autocomplete-text">${this.escapeHtml(s.display)}</span>
-				<span class="autocomplete-type">${s.type}</span>
-				${s.description ? `<span class="autocomplete-desc">${this.escapeHtml(s.description)}</span>` : ''}
-			</div>
-		`).join('');
+		this.autocompleteIndex = 0;
 		
+		// Group by section
+		const grouped = {};
+		suggestions.forEach(s => {
+			const section = s.section || 'Suggestions';
+			if (!grouped[section]) grouped[section] = [];
+			grouped[section].push(s);
+		});
+		
+		let html = '';
+		let globalIndex = 0;
+		
+		for (const [section, items] of Object.entries(grouped)) {
+			html += `<div class="autocomplete-section">${this.escapeHtml(section)}</div>`;
+			for (const item of items) {
+				const isActive = globalIndex === 0 ? 'active' : '';
+				html += `
+					<div class="autocomplete-item ${isActive}" 
+						data-index="${globalIndex}"
+						data-insert="${this.escapeAttr(item.insert_text || item.text)}">
+						<span class="autocomplete-text">${this.escapeHtml(item.display || item.text)}</span>
+						<span class="autocomplete-type">${this.escapeHtml(item.type)}</span>
+						${item.description ? `<span class="autocomplete-desc">${this.escapeHtml(item.description)}</span>` : ''}
+					</div>
+				`;
+				globalIndex++;
+			}
+		}
+		
+		dropdown.innerHTML = html;
 		dropdown.classList.remove('hidden');
 		
-		// Add click handlers
+		// Add event handlers
 		dropdown.querySelectorAll('.autocomplete-item').forEach(item => {
-			item.addEventListener('click', () => {
+			item.addEventListener('mousedown', (e) => {
+				e.preventDefault();
+				e.stopPropagation();
 				this.applyAutocomplete(item.dataset.insert);
+			});
+			
+			item.addEventListener('mouseenter', () => {
+				dropdown.querySelectorAll('.autocomplete-item').forEach(i => i.classList.remove('active'));
+				item.classList.add('active');
+				this.autocompleteIndex = parseInt(item.dataset.index);
 			});
 		});
 	},
@@ -167,7 +230,9 @@ const App = {
 		const dropdown = document.getElementById('autocompleteDropdown');
 		if (dropdown) {
 			dropdown.classList.add('hidden');
+			dropdown.innerHTML = '';
 		}
+		this.autocompleteIndex = -1;
 	},
 	
 	/**
@@ -178,15 +243,22 @@ const App = {
 		if (!dropdown || dropdown.classList.contains('hidden')) return;
 		
 		const items = dropdown.querySelectorAll('.autocomplete-item');
-		const active = dropdown.querySelector('.autocomplete-item.active');
-		let index = active ? parseInt(active.dataset.index) : -1;
+		if (!items.length) return;
 		
-		index += direction;
-		if (index < 0) index = items.length - 1;
-		if (index >= items.length) index = 0;
-		
+		// Remove current active
 		items.forEach(item => item.classList.remove('active'));
-		items[index]?.classList.add('active');
+		
+		// Calculate new index
+		this.autocompleteIndex += direction;
+		if (this.autocompleteIndex < 0) this.autocompleteIndex = items.length - 1;
+		if (this.autocompleteIndex >= items.length) this.autocompleteIndex = 0;
+		
+		// Set new active
+		const activeItem = items[this.autocompleteIndex];
+		if (activeItem) {
+			activeItem.classList.add('active');
+			activeItem.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+		}
 	},
 	
 	/**
@@ -194,8 +266,10 @@ const App = {
 	 */
 	selectAutocomplete() {
 		const dropdown = document.getElementById('autocompleteDropdown');
-		const active = dropdown?.querySelector('.autocomplete-item.active');
-		if (active) {
+		if (!dropdown) return;
+		
+		const active = dropdown.querySelector('.autocomplete-item.active');
+		if (active && active.dataset.insert) {
 			this.applyAutocomplete(active.dataset.insert);
 		}
 	},
@@ -205,7 +279,7 @@ const App = {
 	 */
 	applyAutocomplete(insertText) {
 		const input = document.getElementById('queryInput');
-		if (!input) return;
+		if (!input || !insertText) return;
 		
 		const cursorPos = input.selectionStart;
 		const value = input.value;
@@ -217,7 +291,10 @@ const App = {
 		}
 		
 		// Replace current token with insert text
-		const newValue = value.slice(0, tokenStart) + insertText + value.slice(cursorPos);
+		const before = value.slice(0, tokenStart);
+		const after = value.slice(cursorPos);
+		const newValue = before + insertText + after;
+		
 		input.value = newValue;
 		
 		// Position cursor after inserted text
@@ -226,6 +303,109 @@ const App = {
 		input.focus();
 		
 		this.hideAutocomplete();
+		
+		// Fetch new suggestions if the insert ends with : or we might need more
+		if (insertText.endsWith(':') || insertText.endsWith('=')) {
+			setTimeout(() => {
+				this.fetchAutocomplete(input.value, input.selectionStart);
+			}, 50);
+		}
+	},
+	
+	/**
+	 * Load tree view
+	 */
+	async loadTree() {
+		try {
+			const resp = await fetch('/api/nodes');
+			if (!resp.ok) throw new Error('Failed to load nodes');
+			
+			const data = await resp.json();
+			this.treeNodes = data.nodes;
+			this.renderTree();
+		} catch (e) {
+			console.error('Failed to load tree:', e);
+			document.getElementById('treeView').innerHTML = `<div class="empty-state"><p>Failed to load</p></div>`;
+		}
+	},
+	
+	/**
+	 * Refresh tree
+	 */
+	async refreshTree() {
+		await this.loadTree();
+	},
+	
+	/**
+	 * Render tree view
+	 */
+	renderTree() {
+		const tree = document.getElementById('treeView');
+		if (!tree) return;
+		
+		if (!this.treeNodes.length) {
+			tree.innerHTML = `<div class="tree-empty">No items yet</div>`;
+			return;
+		}
+		
+		tree.innerHTML = '';
+		
+		const rootNodes = this.treeNodes.filter(n => !n.parent);
+		
+		const renderNode = (node, depth = 0) => {
+			const div = document.createElement('div');
+			div.className = `tree-item ${node.type.toLowerCase()}`;
+			div.style.paddingLeft = `${12 + depth * 14}px`;
+			div.dataset.uuid = node.uuid;
+			
+			const icon = node.type === 'VAULT' ? '📁' : '📄';
+			const badge = node.file_count > 0 ? `<span class="tree-badge">${node.file_count}</span>` : '';
+			
+			div.innerHTML = `<span class="tree-icon">${icon}</span><span class="tree-name">${this.escapeHtml(node.name)}</span>${badge}`;
+			
+			div.addEventListener('click', (e) => {
+				e.stopPropagation();
+				this.selectNodeFromTree(node.uuid);
+			});
+			
+			tree.appendChild(div);
+			
+			const children = this.treeNodes.filter(n => n.parent === node.uuid);
+			children.sort((a, b) => {
+				if (a.type !== b.type) return a.type === 'VAULT' ? -1 : 1;
+				return a.name.localeCompare(b.name);
+			});
+			children.forEach(child => renderNode(child, depth + 1));
+		};
+		
+		rootNodes.sort((a, b) => {
+			if (a.type !== b.type) return a.type === 'VAULT' ? -1 : 1;
+			return a.name.localeCompare(b.name);
+		});
+		rootNodes.forEach(node => renderNode(node));
+	},
+	
+	/**
+	 * Select node from tree and update query
+	 */
+	selectNodeFromTree(uuid) {
+		const node = this.treeNodes.find(n => n.uuid === uuid);
+		if (!node) return;
+		
+		// Update tree selection visually
+		document.querySelectorAll('.tree-item').forEach(el => {
+			el.classList.toggle('active', el.dataset.uuid === uuid);
+		});
+		
+		// Set query to inside:path and execute
+		const input = document.getElementById('queryInput');
+		if (input) {
+			input.value = `inside:${node.path}`;
+			this.executeQuery(input.value);
+		}
+		
+		// Also select the node for detail view
+		this.selectNode(uuid);
 	},
 	
 	/**
@@ -284,7 +464,7 @@ const App = {
 				<div class="empty-message">
 					<div class="empty-icon">🔍</div>
 					<div class="empty-title">No results found</div>
-					<div class="empty-text">Try adjusting your query or browse all items.</div>
+					<div class="empty-text">Try adjusting your query or browse the tree.</div>
 				</div>
 			`;
 			return;
@@ -358,6 +538,11 @@ const App = {
 	 * Select and display a node
 	 */
 	async selectNode(uuid) {
+		// Update tree selection
+		document.querySelectorAll('.tree-item').forEach(el => {
+			el.classList.toggle('active', el.dataset.uuid === uuid);
+		});
+		
 		try {
 			const resp = await fetch(`/api/nodes/${uuid}`);
 			if (!resp.ok) throw new Error('Failed to load node');
@@ -383,7 +568,6 @@ const App = {
 		const header = document.getElementById('detailHeader');
 		const body = document.getElementById('detailBody');
 		
-		// Header
 		if (header) {
 			header.innerHTML = `
 				<div class="detail-breadcrumb">${this.escapeHtml(node.path)}</div>
@@ -395,10 +579,8 @@ const App = {
 			`;
 		}
 		
-		// Body
 		let html = '';
 		
-		// Type badge
 		html += `<div class="detail-type-badge ${node.type.toLowerCase()}">${node.type}</div>`;
 		
 		// Metadata
@@ -433,7 +615,7 @@ const App = {
 							${node.tags.map(t => `
 								<span class="tag">
 									${this.escapeHtml(t)}
-									<span class="tag-remove" onclick="App.removeTag('${t}')">&times;</span>
+									<span class="tag-remove" onclick="App.removeTag('${this.escapeAttr(t)}')">&times;</span>
 								</span>
 							`).join('')}
 						</div>
@@ -453,7 +635,7 @@ const App = {
 								<div class="rel-item">
 									<span class="rel-type">${this.escapeHtml(r.relation)}</span>
 									<span class="rel-arrow">→</span>
-									<span class="rel-target" onclick="App.queryPath('${r.target_path}')">${this.escapeHtml(r.target_path)}</span>
+									<span class="rel-target" onclick="App.queryPath('${this.escapeAttr(r.target_path)}')">${this.escapeHtml(r.target_path)}</span>
 								</div>
 							`).join('')}
 						</div>
@@ -471,7 +653,7 @@ const App = {
 						<button class="btn btn-sm btn-secondary" onclick="App.showUploadFile()">Upload</button>
 					</div>
 					<div class="panel-body">
-						<div class="files-grid">
+						<div class="files-grid files-grid-small">
 							${node.files.map(f => this.renderFileCard(f)).join('')}
 						</div>
 					</div>
@@ -553,10 +735,10 @@ const App = {
 		}
 		
 		return `
-			<div class="file-card" onclick="App.openFile('${file.hash}', '${file.ext}', '${this.escapeHtml(file.name)}')">
+			<div class="file-card" onclick="App.openFile('${file.hash}', '${file.ext}', '${this.escapeAttr(file.name)}')">
 				<div class="file-preview">${preview}</div>
 				<div class="file-info">
-					<div class="file-name" title="${this.escapeHtml(file.name)}">${this.escapeHtml(file.name)}</div>
+					<div class="file-name" title="${this.escapeAttr(file.name)}">${this.escapeHtml(file.name)}</div>
 					<div class="file-size">${this.formatSize(file.size)}</div>
 				</div>
 			</div>
@@ -566,7 +748,7 @@ const App = {
 	/**
 	 * Open file in lightbox or download
 	 */
-	async openFile(hash, ext, name) {
+	openFile(hash, ext, name) {
 		const isImage = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'].includes(ext);
 		const isVideo = ['mp4', 'webm', 'mov'].includes(ext);
 		
@@ -577,7 +759,7 @@ const App = {
 			const url = `/api/blobs/${hash}`;
 			
 			if (isImage) {
-				content.innerHTML = `<img src="${url}" alt="${this.escapeHtml(name)}">`;
+				content.innerHTML = `<img src="${url}" alt="${this.escapeAttr(name)}">`;
 			} else {
 				content.innerHTML = `<video src="${url}" controls autoplay></video>`;
 			}
@@ -641,7 +823,8 @@ const App = {
 			}
 			
 			document.getElementById('createNodeModal').classList.add('hidden');
-			this.executeQuery(document.getElementById('queryInput')?.value || '');
+			await this.loadTree();
+			await this.executeQuery(document.getElementById('queryInput')?.value || '');
 			this.selectNode(data.uuid);
 		} catch (e) {
 			this.showError(e.message);
@@ -719,6 +902,11 @@ const App = {
 	 * Show upload file modal
 	 */
 	showUploadFile() {
+		if (!this.currentNode) {
+			this.showError('Select a record first');
+			return;
+		}
+		
 		const input = document.createElement('input');
 		input.type = 'file';
 		input.multiple = true;
@@ -772,7 +960,8 @@ const App = {
 			}
 			
 			this.closeDetail();
-			this.executeQuery(document.getElementById('queryInput')?.value || '');
+			await this.loadTree();
+			await this.executeQuery(document.getElementById('queryInput')?.value || '');
 		} catch (e) {
 			this.showError(e.message);
 		}
@@ -815,6 +1004,14 @@ const App = {
 		const div = document.createElement('div');
 		div.textContent = String(str);
 		return div.innerHTML;
+	},
+	
+	/**
+	 * Escape for attribute
+	 */
+	escapeAttr(str) {
+		if (str === null || str === undefined) return '';
+		return String(str).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 	},
 	
 	/**
