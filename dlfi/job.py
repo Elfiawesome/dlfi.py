@@ -11,14 +11,16 @@ class Job:
 	config: 'JobConfig' = None
 	db: 'DLFI' = None
 
-	def __init__(self, config: 'JobConfig'):
+	def __init__(self, config: 'JobConfig', db: 'DLFI' = None):
 		self.config = config
+		self.db = db
 
-	def run(self, url: str, extr_config: dict = None) -> None:
+	def run(self, url: str, extr_config: dict = None) -> 'JobResult':
+		job_result = JobResult(False)
 		extractor = extractors.get_extractor_for_url(url)
 		if not extractor:
-			logger.error(f"No extractor found for URL: {url}")
-			return
+			job_result.add_error(f"No extractor found for URL: {url}")
+			return job_result
 		
 		if self.config.cookies:
 			extractor.load_cookies(self.config.cookies)
@@ -32,8 +34,10 @@ class Job:
 				try:
 					if node.node_type == "VAULT":
 						self.db.create_vault(node.suggested_path, metadata=node.metadata)
+						job_result.new_vaults += 1
 					else:
 						self.db.create_record(node.suggested_path, metadata=node.metadata)
+						job_result.new_records += 1
 					
 					for tag in node.tags:
 						self.db.add_tag(node.suggested_path, tag)
@@ -46,20 +50,27 @@ class Job:
 								file_stream=file_obj.stream,
 								filename=file_obj.original_name
 							)
+							job_result.new_files += 1
 						except Exception as e:
-							logger.error(f"Failed to ingest file {file_obj.original_name}: {e}", exc_info=True)
+							job_result.add_error(f"Failed to ingest file {file_obj.original_name}: {e}")
 					
 					for rel_name, target_path in node.relationships:
 						try:
 							self.db.link(node.suggested_path, target_path, rel_name)
 						except ValueError as e:
-							logger.warning(f"Could not link {node.suggested_path} -> {target_path}: {e}")
+							job_result.add_warning(f"Could not link {node.suggested_path} -> {target_path}: {e}")
 
 				except Exception as e:
-					logger.error(f"Failed to process node {node.suggested_path}: {e}", exc_info=True)
+					job_result.add_error(f"Failed to process node {node.suggested_path}: {e}")
 
 		except Exception as e:
 			logger.critical(f"Fatal error during extraction job: {e}", exc_info=True)
+			job_result.success = False
+		
+		if job_result.error_messages == 0:
+			job_result.success = True
+
+		return job_result
 
 
 @dataclass
@@ -71,3 +82,18 @@ class JobConfig:
 			self.cookies = Path(cookies).resolve()
 		else:
 			self.cookies = None
+
+class JobResult:
+	def __init__(self, success: bool):
+		self.success = success
+		self.new_vaults: int = 0
+		self.new_records: int = 0
+		self.new_files: int = 0
+		self.error_messages: list[str] = []
+	
+	def add_error(self, error: str) -> None:
+		logger.error(error, exc_info=True)
+		self.error_messages.append(error)
+
+	def add_warning(self, warn: str) -> None:
+		logger.warning(warn)

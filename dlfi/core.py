@@ -385,6 +385,8 @@ class DLFI:
 
 			if row:
 				current_parent_uuid = row[0]
+
+				logger.debug(f"Updated existing {node_type} at \"{current_path_str}\"")
 			else:
 				if not create_if_missing:
 					return None
@@ -399,6 +401,8 @@ class DLFI:
 						VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 					""", (new_uuid, current_parent_uuid, actual_type, part, current_path_str, actual_meta, time.time(), time.time()))
 				
+				logger.debug(f"Created new {node_type} at \"{current_path_str}\"")
+
 				current_parent_uuid = new_uuid
 
 		return current_parent_uuid

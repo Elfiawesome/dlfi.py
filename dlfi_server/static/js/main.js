@@ -1271,7 +1271,6 @@ const App = {
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({
 					url,
-					extractor: slug || undefined,
 					config,
 					cookies_path: cookies || undefined
 				})

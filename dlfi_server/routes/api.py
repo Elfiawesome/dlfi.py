@@ -1296,94 +1296,21 @@ def run_extractor():
 	dlfi = get_dlfi()
 	data = request.get_json() or {}
 	
-	url = data.get("url", "").strip()
-	extractor_slug = data.get("extractor")  # Optional - auto-detect if not provided
-	config = data.get("config", {})
-	cookies_path = data.get("cookies_path")
+	url: str = data.get("url", "")
+	config: dict = data.get("config", {})
+	cookies_path: str | None = data.get("cookies_path", None)
 	
 	if not url:
 		return jsonify({"error": "URL is required"}), 400
 	
-	try:
-		import extractors
-		
-		# Find extractor
-		extractor = None
-		if extractor_slug:
-			for ext in extractors.AVAILABLE_EXTRACTORS:
-				ext_slug = getattr(ext, 'slug', ext.name.lower())
-				if ext_slug == extractor_slug:
-					extractor = ext
-					break
-			if not extractor:
-				return jsonify({"error": f"Extractor '{extractor_slug}' not found"}), 404
-		else:
-			# Auto-detect
-			extractor = extractors.get_extractor_for_url(url)
-			if not extractor:
-				return jsonify({"error": "No extractor found for this URL"}), 400
-		
-		# Create job
-		job_config = JobConfig(cookies=cookies_path)
-		job = Job(job_config)
-		job.db = dlfi
-		
-		# Run extraction (this is synchronous for now)
-		# In a production app, you'd want to run this in a background task
-		logger.info(f"Starting extraction: {url} with {extractor.name}")
-		
-		nodes_created = 0
-		files_added = 0
-		errors = []
-		
-		try:
-			for node in extractor.extract(url, config):
-				try:
-					if node.node_type == "VAULT":
-						dlfi.create_vault(node.suggested_path, metadata=node.metadata)
-					else:
-						dlfi.create_record(node.suggested_path, metadata=node.metadata)
-					
-					nodes_created += 1
-					
-					for tag in node.tags:
-						dlfi.add_tag(node.suggested_path, tag)
-					
-					for file_obj in node.files:
-						try:
-							dlfi.append_stream(
-								record_path=node.suggested_path,
-								file_stream=file_obj.stream,
-								filename=file_obj.original_name
-							)
-							files_added += 1
-						except Exception as e:
-							errors.append(f"File {file_obj.original_name}: {str(e)}")
-					
-					for rel_name, target_path in node.relationships:
-						try:
-							dlfi.link(node.suggested_path, target_path, rel_name)
-						except ValueError:
-							pass  # Target may not exist yet
-				
-				except Exception as e:
-					errors.append(f"Node {node.suggested_path}: {str(e)}")
-		
-		except Exception as e:
-			errors.append(f"Extraction error: {str(e)}")
-		
-		return jsonify({
-			"success": True,
-			"nodes_created": nodes_created,
-			"files_added": files_added,
-			"errors": errors[:10]  # Limit error list
-		})
-		
-	except ImportError as e:
-		return jsonify({"error": f"Import error: {str(e)}"}), 500
-	except Exception as e:
-		logger.exception("Extractor run failed")
-		return jsonify({"error": str(e)}), 500
+	job = Job(JobConfig(cookies=cookies_path), db = dlfi)
+	result = job.run(url.strip(), extr_config=config)
+	return jsonify({
+		"success": result.success,
+		"nodes_created": result.new_records + result.new_vaults,
+		"files_added": result.new_files,
+		"errors": result.error_messages
+	})
 
 
 @api_bp.route("/nodes/<uuid>/preview", methods=["GET"])
