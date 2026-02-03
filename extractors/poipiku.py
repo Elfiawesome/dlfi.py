@@ -18,7 +18,8 @@ class PoipikuExtractor(BaseExtractor):
 	TITLE_PATTERN = re.compile(r'<title>(.*?)<', re.IGNORECASE)
 	DESC_PATTERN = re.compile(r'class="IllustItemDesc"[^>]*>(.*?)</h1>', re.IGNORECASE | re.DOTALL)
 	USER_NAME_PATTERN = re.compile(r'class="UserInfoUserName"[^>]*>.*?<a[^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL)
-	
+	USER_DESCRIPTION_PATTERN = re.compile(r'class="UserInfoProfile"[^>]*>(.*?)<\/h3>')
+
 	# Content Regex
 	IMG_SRC_PATTERN = re.compile(r'src="([^"]+)"')
 	ILLUST_INFO_PATTERN = re.compile(r'class="IllustInfo"\s+href="([^"]+)"') # Extracts relative paths like /123/456.html
@@ -94,11 +95,28 @@ class PoipikuExtractor(BaseExtractor):
 		page = config["page_start"]
 		max_pages = config["max_pages"]
 		
+		user_url = f"{self.ROOT_URL}/{user_id}"
+		try:
+			resp = self._request("GET", user_url)
+			html = resp.text
+		except Exception as e:
+			logger.error(f"[{self.name}] Failed to fetch page {page}: {e}")
+		
+		user_name_match = self.USER_NAME_PATTERN.search(html)
+		user_description_match = self.USER_DESCRIPTION_PATTERN.search(html)
+		
+		metadata = {
+			"user_id": user_id,
+			"url": user_url,
+			"user_name": user_name_match.group(1).strip() if user_name_match else user_id,
+			"description": user_description_match.group(1).strip().replace("<br />", "\n") if user_description_match else "",
+		}
+
 		# Create a Vault node for the user
 		yield DiscoveredNode(
 			suggested_path=f"poipiku/users/{user_id}",
 			node_type="VAULT",
-			metadata={"user_id": user_id}
+			metadata=metadata
 		)
 
 		while True:
